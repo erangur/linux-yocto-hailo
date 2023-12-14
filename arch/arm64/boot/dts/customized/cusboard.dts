@@ -35,6 +35,23 @@
      };
 };
 
+&i2c_1 {
+    status = "ok";
+    codec_tlv320aic3104: tlv320aic3104@18 {
+        #sound-dai-cells = <0>;
+        compatible = "ti,tlv320aic3104";
+        reg = <0x18>;
+        ai3x-source-clk = "bclk";
+        ai3x-micbias-vg = <2>;
+                /* Regulators */
+                AVDD-supply = <&regulator_3p3v>;
+                IOVDD-supply = <&regulator_1p8v>;
+                DRVDD-supply = <&regulator_3p3v>;
+                DVDD-supply = <&regulator_1p8v>;
+    };
+};
+
+
 &csi2rx0 {
     status = "ok";
     ports {

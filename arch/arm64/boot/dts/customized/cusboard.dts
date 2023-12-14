@@ -1,0 +1,2 @@
+/dts-v1/;
+#include "../hailo/hailo15-base.dtsi"

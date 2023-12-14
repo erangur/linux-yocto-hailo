@@ -4,7 +4,7 @@
  */
 
 /dts-v1/;
-#include "hailo15-base.dtsi"
+#include "../hailo/hailo15-base.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 
 / {

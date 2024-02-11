@@ -31,3 +31,4 @@ subdir-y += synaptics
 subdir-y += ti
 subdir-y += toshiba
 subdir-y += xilinx
+subdir-y += greenbase

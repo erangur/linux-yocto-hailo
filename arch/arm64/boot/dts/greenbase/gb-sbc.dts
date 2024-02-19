@@ -154,7 +154,7 @@
     status = "ok";
     pinctrl-names = "default";
     pinctrl-0 = <&pinctrl_eth>;
-    phy-mode = "rmii";
+    phy-mode = "rmii-id";
 };
 
 &qspi {

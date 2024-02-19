@@ -25,7 +25,7 @@
         clock-names = "inclk";
         clock-frequency = <24000000>;
         csi-id = <0>;
-        reset-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+        reset-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
         port {
             sensor_out_csi2rx: endpoint {
                 data-lanes = <1 2 3 4>;
@@ -240,12 +240,6 @@
  status = "ok"; 
 };
 
-&i2c_2 {
-    status = "ok";
-    pinctrl-names = "default";
-    pinctrl-0 = <&pinctrl_i2c2>, <&pinctrl_i2c2_current_src_en_out>;
-};
-
 &serial2 {
     status = "ok";
     pinctrl-names = "default";
@@ -280,50 +274,6 @@
         groups = "uart3_2_grp";
     };
 
-    pinctrl_i2c2: i2c2 {
-        function = "i2c2";
-        groups = "i2c2_1_grp";
-    };
-
-    pinctrl_i2c0_current_src_en_out: i2c0_current_src_en_out {
-        function = "i2c0_current_src_en_out";
-        groups = "i2c0_current_src_en_out_3_grp";
-    };
-
-    pinctrl_i2c1_current_src_en_out: i2c1_current_src_en_out {
-        function = "i2c1_current_src_en_out";
-        groups = "i2c1_current_src_en_out_4_grp";
-    };
-
-    pinctrl_i2c2_current_src_en_out: i2c2_current_src_en_out {
-        function = "i2c2_current_src_en_out";
-        groups = "i2c2_current_src_en_out_3_grp";
-    };
-
-    pinctrl_sdio0_gp_in: sdio0_gp_in {
-        function = "sdio0_gp_in";
-        groups = "sdio0_gp_in_grp";
-    };
-
-    pinctrl_sdio1_gp_in: sdio1_gp_in {
-        function = "sdio1_gp_in";
-        groups = "sdio1_gp_in_grp";
-    };
-
-    pinctrl_sdio0_CD_in: sdio0_CD_in {
-        function = "sdio0_CD_in";
-        groups = "sdio0_CD_in_grp";
-    };
-
-    pinctrl_sdio1_CD_in: sdio1_CD_in {
-        function = "sdio1_CD_in";
-        groups = "sdio1_CD_in_grp";
-    };
-
-    pinctrl_uart0_cts_rts: uart0_cts_rts {
-        function = "uart0_cts_rts";
-        groups = "uart0_cts_rts_1_grp";
-    };
 };
 
 &gpio0 {

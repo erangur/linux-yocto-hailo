@@ -2013,6 +2013,8 @@ static int imx678_parse_hw_config(struct imx678 *imx678)
 	if (!fwnode)
 		return -ENXIO;
 
+	dev_err(imx678->dev, "Tanya amazing2");
+
 	/* Request optional reset pin */
 	imx678->reset_gpio =
 		devm_gpiod_get_optional(imx678->dev, "reset", GPIOD_OUT_LOW);
@@ -2021,6 +2023,7 @@ static int imx678_parse_hw_config(struct imx678 *imx678)
 			PTR_ERR(imx678->reset_gpio));
 		return PTR_ERR(imx678->reset_gpio);
 	}
+	dev_err(imx678->dev, "Tanya amazing3");
 
 	/* Get sensor input clock */
 	imx678->inclk = devm_clk_get(imx678->dev, NULL);
@@ -2103,6 +2106,7 @@ static int imx678_power_on(struct device *dev)
 	int ret;
 
 	gpiod_set_value_cansleep(imx678->reset_gpio, 1);
+	dev_err(imx678->dev, "Tanya amazing");
 
 	ret = clk_prepare_enable(imx678->inclk);
 	if (ret) {

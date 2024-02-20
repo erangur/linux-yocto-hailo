@@ -38,29 +38,29 @@
 
 &i2c_1 {
     status = "ok";
-    ina231_1v8: 1v8@40 {
-        compatible = "ti,ina231_precise";
-        reg = <0x40>;
-        shunt-resistor = <100000>;
-        max-current = <260>;
-    };
-    ina231_DDR_VDDQX: DDR_VDDQX@42 {
-        compatible = "ti,ina231_precise";
-        reg = <0x42>;
-        shunt-resistor = <100000>;
-        max-current = <170>;
-    };
-    ina231_0v8: 0v8@43 {
-        compatible = "ti,ina231_precise";
-        reg = <0x43>;
-        shunt-resistor = <1000>;
-        max-current = <11755>;
-    };
+    // ina231_1v8: 1v8@40 {
+    //     compatible = "ti,ina231_precise";
+    //     reg = <0x40>;
+    //     shunt-resistor = <100000>;
+    //     max-current = <260>;
+    // };
+    // ina231_DDR_VDDQX: DDR_VDDQX@42 {
+    //     compatible = "ti,ina231_precise";
+    //     reg = <0x42>;
+    //     shunt-resistor = <100000>;
+    //     max-current = <170>;
+    // };
+    // ina231_0v8: 0v8@43 {
+    //     compatible = "ti,ina231_precise";
+    //     reg = <0x43>;
+    //     shunt-resistor = <1000>;
+    //     max-current = <11755>;
+    // };
 
-    tmp175_NEAR_H15_SOC: NEAR_H15_SOC@2c {
-        compatible = "ti,tmp175";
-        reg = <0x2c>;
-    };
+    // tmp175_NEAR_H15_SOC: NEAR_H15_SOC@2c {
+    //     compatible = "ti,tmp175";
+    //     reg = <0x2c>;
+    // };
 
     codec_tlv320aic3104: tlv320aic3104@18 {
         #sound-dai-cells = <0>;

@@ -25,7 +25,7 @@
         clock-names = "inclk";
         clock-frequency = <24000000>;
         csi-id = <0>;
-        reset-gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;
+        reset-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
         port {
             sensor_out_csi2rx: endpoint {
                 data-lanes = <1 2 3 4>;

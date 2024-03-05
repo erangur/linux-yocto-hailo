@@ -280,57 +280,55 @@
     gpio-ranges = <&pinctrl 0 0 16>;
 
     gpio-line-names =
-        "SPI_CS2",
-        "SPI_CS2",
-        "DSI_RST",
-        "CAM_TRIG",
-        "cam0_reset_n",
-        "cam1_reset_n",
-        "gpio_in_out_6",
-        "gpio_in_out_7",
-        "gpio_in_out_8",
-        "sdio0_gp_in",
-        "sdio0_cd_in",
-        "usb_overcurrent_n_in",
-        "usb_drive_vbus_out",
-        "sdio1_gp_in",
-        "sdio1_cd_in_n",
-        "RVSD";
+        "NC",
+        "NC",
+        "NC",
+        "NC",
+        "SEN_MCU_RX",
+        "MCU_ZB_RX",
+        "SEN_MCU_TX",
+        "MCU_ZB_TX",
+        "NC",
+        "SD_SEL",
+        "MCU_TCK",
+        "MCU_TDIO_RST_N",
+        "NC",
+        "ZIGBEE_RST_N",
+        "NC",
+        "NC";
 };
 
 &gpio1 {
     gpio-ranges = <&pinctrl 0 16 16>;
 
     gpio-line-names =
-        "gpio_in_out_16",
-        "WiFi_BT_disable_n",
-        "timer_ext_in0",
-        "timer_ext_in1",
-        "shut_down_out",
-        "user_LED",
-        "i2c2_sda_in_out",
-        "i2c2_scl_out",
-        "i2c2_current_src_en_out",
-        "i2c0_current_src_en_out",
-        "i2c1_current_src_en_out",
-        "gpio_in_out_27",
-        "gpio_in_out_28",
-        "DSI_INTR",
-        "uart0_cts_pad_in",
-        "uart0_rts_pad_out";
+        "IP_ID0",
+        "IP_ID1",
+        "AUD_RST_N",
+        "NC",
+        "SEN_RST_N",
+        "ETH_RST_N",
+        "NC",
+        "NR_ON_OFF",
+        "GYRO_INT_N",
+        "NC",
+        "NC",
+        "NC",
+        "NC",
+        "TCK_RTSn_SoC",
+        "TDIO_DTRn_SoC",
+        "NC";
 
-    pin_WiFi_BT_disable_n {
-        gpio-hog;
-        gpios = <1 GPIO_ACTIVE_HIGH>;
-        output-low;
-        line-name = "WiFi_BT_disable_n";
-    };
+    eth_rst_n {
 
-    pin_DSI_INTR {
         gpio-hog;
-        gpios = <13 GPIO_ACTIVE_HIGH>;
-        output-low;
-        line-name = "DSI_INTR";
+
+        gpios = <5 GPIO_ACTIVE_HIGH>;
+
+        output-high;
+
+        line-name = "gpio_21";
+
     };
 };
 

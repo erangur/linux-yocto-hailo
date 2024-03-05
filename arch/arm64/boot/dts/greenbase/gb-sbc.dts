@@ -332,5 +332,17 @@
         output-low;
         line-name = "DSI_INTR";
     };
+
+    gpio_18 {
+
+        gpio-hog;
+
+        gpios = <2 GPIO_ACTIVE_HIGH>;
+
+        output-high;
+
+        line-name = "gpio_18";
+
+    };
 };
 

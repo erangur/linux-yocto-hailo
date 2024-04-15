@@ -1,6 +1,7 @@
 #ifndef __HAILO15_ISP_DRIVER__
 #define __HAILO15_ISP_DRIVER__
 
+#include <linux/list.h>
 #include <linux/clk.h>
 #include <linux/spinlock.h>
 #include <media/v4l2-device.h>
@@ -12,11 +13,16 @@
 #include "common.h"
 #include "fe/fe_dev.h"
 
+#define HAILO15_ISP_NAME "hailo-isp"
+
 /* We double the needed queue size for safety */
 #define HAILO15_ISP_EVENT_QUEUE_SIZE (250 * 2)
 
+#define HAILO15_ISP_CHN_MAX 2 // S0/S1 - also called "port" in isp_mcm_buf
+#define HAILO15_ISP_PATHS_MAX 2 // MP/SP
+
 struct isp_mcm_buf {
-	uint32_t port;
+	uint32_t port; // channel
 	uint32_t path;
 	uint32_t num_planes;
 	uint64_t addr[3];
@@ -38,9 +44,19 @@ enum hailo15_source_pads {
 };
 
 #define HAILO15_ISP_PADS_NR (HAILO15_ISP_SOURCE_PAD_MAX)
-#define HAILO15_ISP_SOURCE_PADS_NR                                             \
-	(HAILO15_ISP_SOURCE_PAD_MAX - HAILO15_ISP_SINK_PAD_MAX)
+#define HAILO15_ISP_SOURCE_PADS_NR (HAILO15_ISP_SOURCE_PAD_MAX - HAILO15_ISP_SINK_PAD_MAX)
 #define HAILO15_ISP_SINK_PADS_NR (HAILO15_ISP_SINK_PAD_MAX)
+
+#define HAILO15_ISP_SINK_PAD_BEGIN (HAILO15_ISP_SINK_PAD_S0)
+#define HAILO15_ISP_SINK_PAD_END (HAILO15_ISP_SINK_PAD_MAX)
+#define HAILO15_ISP_SOURCE_PAD_BEGIN (HAILO15_ISP_SINK_PAD_MAX)
+#define HAILO15_ISP_SOURCE_PAD_END (HAILO15_ISP_SOURCE_PAD_MAX)
+
+#define HAILO15_ISP_SOURCE_PAD_MP_BEGIN (HAILO15_ISP_SOURCE_PAD_MP_S0)
+#define HAILO15_ISP_SOURCE_PAD_MP_END (HAILO15_ISP_SOURCE_PAD_MP_BEGIN + HAILO15_ISP_CHN_MAX)
+#define HAILO15_ISP_SOURCE_PAD_SP_BEGIN (HAILO15_ISP_SOURCE_PAD_SP_S0)
+#define HAILO15_ISP_SOURCE_PAD_SP_END (HAILO15_ISP_SOURCE_PAD_SP_BEGIN + HAILO15_ISP_CHN_MAX)
+
 
 enum { ISPIOC_S_MIV_INFO = 0x107,
        ISPIOC_S_MIS_IRQADDR = 0x101,
@@ -76,7 +92,40 @@ struct hailo15_isp_sink_pad_handle {
 };
 enum { ISP_MP,
        ISP_SP2,
+       ISP_MCM_IN,
        ISP_MAX_PATH,
+};
+
+struct hailo15_isp_mbus_fmt {
+	uint32_t code;
+};
+
+struct hailo15_isp_fmt_size {
+	uint32_t image_size;
+	uint32_t num_planes;
+	uint32_t planes_size[VIDEO_MAX_PLANES];
+	uint32_t planes_offset[VIDEO_MAX_PLANES];
+
+};
+
+struct hailo15_isp_pad_data {
+	uint32_t sink_detected;
+	struct v4l2_mbus_framefmt format;
+	struct hailo15_isp_fmt_size fmt_size;
+	struct v4l2_fract frmival_min;
+    struct v4l2_fract frmival_max;
+	uint32_t num_formats;
+	struct hailo15_isp_mbus_fmt *mbus_fmt;
+	struct list_head queue;
+	struct list_head mcm_queue;
+	spinlock_t qlock;
+	uint32_t stream;
+	struct hailo15_vb2_buffer *buf;
+	struct hailo15_vb2_buffer *shd_buf;
+	struct v4l2_rect crop;
+	struct v4l2_rect compose;
+	uint32_t sequence;
+	struct hailo15_pad_stat_subscribe stat_sub[HAILO15_UEVENT_ISP_STAT_MAX];
 };
 
 struct hailo15_isp_device {
@@ -85,6 +134,7 @@ struct hailo15_isp_device {
 	struct v4l2_ctrl_handler ctrl_handler;
 	uint32_t ctrl_pad;
 	struct media_pad pads[HAILO15_ISP_PADS_NR];
+    struct hailo15_isp_pad_data pad_data[HAILO15_ISP_PADS_NR];
 	struct hailo15_isp_src_pad_handle
 		src_pad_handles[HAILO15_ISP_SOURCE_PADS_NR];
 	struct hailo15_isp_sink_pad_handle
@@ -99,15 +149,15 @@ struct hailo15_isp_device {
 	struct mutex ctrl_lock;
 	spinlock_t slock;
 	int32_t refcnt;
-	struct hailo15_video_event_resource event_resource;
+	struct hailo15_event_resource event_resource;
 	struct hailo15_isp_irq_status irq_status;
 	struct hailo15_rmem rmem;
-	struct hailo15_buf_ctx *buf_ctx;
+	struct hailo15_buf_ctx *buf_ctx[ISP_MAX_PATH];
 	struct hailo15_buffer *cur_buf[ISP_MAX_PATH];
 	struct v4l2_subdev_format fmt[ISP_MAX_PATH];
 	struct clk *ip_clk;
 	struct clk *p_clk;
-	uint64_t frame_count;
+	uint64_t frame_count[ISP_MAX_PATH];
 	int is_ip_clk_enabled;
 	int is_p_clk_enabled;
 	void *rmem_vaddr;
@@ -128,6 +178,12 @@ struct hailo15_isp_device {
 	struct vvcam_fe_dev* fe_dev;
 	int mcm_mode;
 	struct v4l2_subdev_format input_fmt;
+	struct list_head mcm_queue;
+	spinlock_t mcm_lock;
+	int rdma_enable;
+	int dma_ready;
+	int frame_end;
+	int fe_ready;
 };
 
 
@@ -140,13 +196,14 @@ void hailo15_isp_buffer_done(struct hailo15_isp_device *, int path);
 void hailo15_config_isp_wrapper(struct hailo15_isp_device *isp_dev);
 int hailo15_isp_is_path_enabled(struct hailo15_isp_device *, int);
 int hailo15_isp_dma_set_enable(struct hailo15_isp_device *, int, int);
-int hailo15_video_post_event_set_fmt(struct hailo15_isp_device *isp_dev,
+int hailo15_isp_post_event_set_fmt(struct hailo15_isp_device *isp_dev,
 				     int pad,
 				     struct v4l2_mbus_framefmt *format);
-int hailo15_video_post_event_start_stream(struct hailo15_isp_device *isp_dev);
-int hailo15_video_post_event_stop_stream(struct hailo15_isp_device *isp_dev);
-int hailo15_video_post_event_requebus(struct hailo15_isp_device *isp_dev,
+int hailo15_isp_post_event_start_stream(struct hailo15_isp_device *isp_dev);
+int hailo15_isp_post_event_stop_stream(struct hailo15_isp_device *isp_dev);
+int hailo15_isp_post_event_requebus(struct hailo15_isp_device *isp_dev,
 				      int pad, uint32_t num_buffers);
+int hailo15_isp_s_stream_event(struct hailo15_isp_device *isp_dev, int pad, uint32_t status);
 int hailo15_isp_s_ctrl_event(struct hailo15_isp_device *isp_dev, int pad,
 			     struct v4l2_ctrl *ctrl);
 int hailo15_isp_g_ctrl_event(struct hailo15_isp_device *isp_dev, int pad,

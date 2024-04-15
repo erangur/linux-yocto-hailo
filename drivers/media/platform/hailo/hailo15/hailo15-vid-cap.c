@@ -12,6 +12,7 @@
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-dma-contig.h>
 #include "hailo15-events.h"
+#include "hailo15-media.h"
 
 #define HAILO_VID_NAME "hailo_video"
 
@@ -27,7 +28,7 @@
 	do {                                                                   \
 		if ((index) >= MAX_VIDEO_NODE_NUM) {                           \
 			pr_err("%s: id %d is too large (id > %d) \n",          \
-			       __func__, index, MAX_VIDEO_NODE_NUM);           \
+				   __func__, index, MAX_VIDEO_NODE_NUM);           \
 			do_fail;                                               \
 		}                                                              \
 	} while (0);
@@ -35,7 +36,7 @@
 	do {                                                                       \
 		if ((vid_node)->streaming) {                                       \
 			pr_err("video_device: tried to call %s while steaming!\n", \
-			       __func__);                                          \
+				   __func__);                                          \
 			do_fail;                                                   \
 		}                                                                  \
 	} while (0);
@@ -56,7 +57,7 @@ struct mutex sd_mutex;
 	})
 
 static int hailo15_querycap(struct file *file, void *fh,
-			    struct v4l2_capability *cap)
+				struct v4l2_capability *cap)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	if (WARN_ON(!vid_node))
@@ -71,6 +72,21 @@ static int hailo15_querycap(struct file *file, void *fh,
 	return 0;
 }
 
+static struct v4l2_subdev *hailo15_video_remote_subdev(struct hailo15_video_node *hailo15_vdev)
+{
+	struct media_pad *pad;
+	struct v4l2_subdev *subdev;
+
+	pad = media_entity_remote_pad(&hailo15_vdev->pad);
+
+	if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+		return NULL;
+
+	subdev = media_entity_to_v4l2_subdev(pad->entity);
+
+	return subdev;
+}
+
 static int hailo15_video_create_pipeline(struct hailo15_video_node *vid_node)
 {
 	int ret = 0;
@@ -79,7 +95,7 @@ static int hailo15_video_create_pipeline(struct hailo15_video_node *vid_node)
 		ret = hailo15_video_post_event_create_pipeline(vid_node);
 		if (ret) {
 			pr_err("%s - post event failed and returned: %d\n",
-			       __func__, ret);
+				   __func__, ret);
 			return ret;
 		}
 	}
@@ -88,7 +104,7 @@ static int hailo15_video_create_pipeline(struct hailo15_video_node *vid_node)
 }
 
 static int hailo15_enum_fmt_vid_cap(struct file *file, void *priv,
-				    struct v4l2_fmtdesc *f)
+					struct v4l2_fmtdesc *f)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	int ret = 0;
@@ -149,7 +165,7 @@ static inline void init_v4l2_subdev_fmt(struct v4l2_subdev_format *subdev_fmt,
 }
 
 static int _hailo15_try_fmt_vid_cap(struct file *file, void *priv,
-				    struct v4l2_format *f, int active)
+					struct v4l2_format *f, int active)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
@@ -174,11 +190,10 @@ static int _hailo15_try_fmt_vid_cap(struct file *file, void *priv,
 	if (!V4L2_TYPE_IS_MULTIPLANAR(f->type))
 		return -EINVAL;
 
-	format = hailo15_fourcc_get_format(pix_mp->pixelformat);
-
-	if (format == NULL) {
+	format = hailo15_fourcc_get_format(pix_mp->pixelformat, pix_mp->num_planes);
+	
+	if (format == NULL)
 		return -EINVAL;
-	}
 
 	if (pix_mp->width % format->width_modulus)
 		return -EINVAL;
@@ -260,12 +275,13 @@ static void hailo15_video_node_queue_clean(struct hailo15_video_node *vid_node,
 		vb2_buffer_done(&vid_node->prev_buf->vb.vb2_buf, state);
 		vid_node->prev_buf = NULL;
 	}
+	vid_node->skip_first_list_entry = false;
 	spin_unlock_irqrestore(&vid_node->qlock, flags);
 }
 
 static int
 hailo15_video_node_subdev_set_stream(struct hailo15_video_node *vid_node,
-				     int enable)
+					 int enable)
 {
 	if (WARN_ON(!vid_node))
 		return -EINVAL;
@@ -283,7 +299,7 @@ static int hailo15_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
 
 	if (WARN_ON(!vid_node)) {
 		pr_err("%s - failed to get vid_node from device video_drvdata\n",
-		       __func__);
+			   __func__);
 		return -EINVAL;
 	}
 
@@ -293,7 +309,7 @@ static int hailo15_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
 		if (ret) {
 			mutex_unlock(&vid_node->ioctl_mutex);
 			pr_err("%s - ERROR from vb2_ioctl_streamon: %d\n",
-			       __func__, ret);
+				   __func__, ret);
 			return -EINVAL;
 		}
 		mutex_unlock(&vid_node->ioctl_mutex);
@@ -310,14 +326,14 @@ static int hailo15_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
 	return 0;
 }
 static int hailo15_streamoff(struct file *file, void *priv,
-			     enum v4l2_buf_type i)
+				 enum v4l2_buf_type i)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	int ret = 0;
 
 	if (WARN_ON(!vid_node)) {
 		pr_err("%s - failed to get vid_node from device video_drvdata\n",
-		       __func__);
+			   __func__);
 		return -EINVAL;
 	}
 
@@ -338,23 +354,6 @@ static int hailo15_streamoff(struct file *file, void *priv,
 
 	mutex_unlock(&vid_node->ioctl_mutex);
 	return ret;
-}
-
-static int
-hailo15_vidioc_subscribe_event(struct v4l2_fh *fh,
-			       const struct v4l2_event_subscription *sub)
-{
-	switch (sub->type) {
-	case V4L2_EVENT_CTRL:
-		return v4l2_ctrl_subscribe_event(fh, sub);
-	case HAILO15_DEAMON_VIDEO_EVENT:
-		return v4l2_event_subscribe(
-			fh, sub, HAILO15_DAEMON_VIDEO_EVENT_MAX, NULL);
-	default:
-		pr_debug("%s - got bad video event type: %u\n", __func__,
-			 sub->type);
-		return -EINVAL;
-	}
 }
 
 static int hailo15_s_parm(struct file *file, void *fh,
@@ -410,7 +409,7 @@ static int hailo15_g_parm(struct file *file, void *fh,
 }
 
 int hailo15_reqbufs(struct file *file, void *priv,
-		    struct v4l2_requestbuffers *p)
+			struct v4l2_requestbuffers *p)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct media_pad *pad;
@@ -429,12 +428,12 @@ int hailo15_reqbufs(struct file *file, void *priv,
 
 	if (vid_node->path != VID_GRP_P2A)
 		hailo15_subdev_call(vid_node, core, ioctl, ISPIOC_V4L2_REQBUFS,
-				    &req);
+					&req);
 	return ret;
 }
 
 static int hailo15_videoc_queryctrl(struct file *file, void *fh,
-				    struct v4l2_queryctrl *a)
+					struct v4l2_queryctrl *a)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct media_pad *pad;
@@ -445,7 +444,7 @@ static int hailo15_videoc_queryctrl(struct file *file, void *fh,
 	pad_query_ctrl.pad = pad->index;
 	pad_query_ctrl.query_ctrl = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_QUERYCTRL, &pad_query_ctrl);
+				   HAILO15_PAD_QUERYCTRL, &pad_query_ctrl);
 
 	return ret;
 }
@@ -462,7 +461,7 @@ static int hailo15_videoc_query_ext_ctrl(struct file *file, void *fh,
 	pad_query_ext_ctrl.pad = pad->index;
 	pad_query_ext_ctrl.query_ext_ctrl = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_QUERY_EXT_CTRL, &pad_query_ext_ctrl);
+				   HAILO15_PAD_QUERY_EXT_CTRL, &pad_query_ext_ctrl);
 
 	return ret;
 }
@@ -479,7 +478,7 @@ static int hailo15_vidioc_g_ctrl(struct file *file, void *fh,
 	pad_control.pad = pad->index;
 	pad_control.control = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_G_CTRL, &pad_control);
+				   HAILO15_PAD_G_CTRL, &pad_control);
 
 	return ret;
 }
@@ -496,13 +495,13 @@ static int hailo15_vidioc_s_ctrl(struct file *file, void *fh,
 	pad_control.pad = pad->index;
 	pad_control.control = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_S_CTRL, &pad_control);
+				   HAILO15_PAD_S_CTRL, &pad_control);
 
 	return ret;
 }
 
 static int hailo15_vidioc_g_ext_ctrls(struct file *file, void *fh,
-				      struct v4l2_ext_controls *a)
+					  struct v4l2_ext_controls *a)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct media_pad *pad;
@@ -513,13 +512,13 @@ static int hailo15_vidioc_g_ext_ctrls(struct file *file, void *fh,
 	pad_ext_controls.pad = pad->index;
 	pad_ext_controls.ext_controls = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_G_EXT_CTRLS, &pad_ext_controls);
+				   HAILO15_PAD_G_EXT_CTRLS, &pad_ext_controls);
 
 	return ret;
 }
 
 static int hailo15_vidioc_s_ext_ctrls(struct file *file, void *fh,
-				      struct v4l2_ext_controls *a)
+					  struct v4l2_ext_controls *a)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct media_pad *pad;
@@ -530,7 +529,7 @@ static int hailo15_vidioc_s_ext_ctrls(struct file *file, void *fh,
 	pad_ext_controls.pad = pad->index;
 	pad_ext_controls.ext_controls = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_S_EXT_CTRLS, &pad_ext_controls);
+				   HAILO15_PAD_S_EXT_CTRLS, &pad_ext_controls);
 
 	return ret;
 }
@@ -547,13 +546,13 @@ static int hailo15_vidioc_try_ext_ctrls(struct file *file, void *fh,
 	pad_ext_controls.pad = pad->index;
 	pad_ext_controls.ext_controls = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_TRY_EXT_CTRLS, &pad_ext_controls);
+				   HAILO15_PAD_TRY_EXT_CTRLS, &pad_ext_controls);
 
 	return ret;
 }
 
 static int hailo15_vidioc_querymenu(struct file *file, void *fh,
-				    struct v4l2_querymenu *a)
+					struct v4l2_querymenu *a)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct media_pad *pad;
@@ -564,7 +563,89 @@ static int hailo15_vidioc_querymenu(struct file *file, void *fh,
 	pad_querymenu.pad = pad->index;
 	pad_querymenu.querymenu = a;
 	ret = v4l2_subdev_call(vid_node->direct_sd, core, ioctl,
-			       HAILO15_PAD_QUERYMENU, &pad_querymenu);
+				   HAILO15_PAD_QUERYMENU, &pad_querymenu);
+
+	return ret;
+}
+
+static int hailo15_videoc_subscribe_event(struct v4l2_fh *fh,
+						const struct v4l2_event_subscription *sub)
+{
+	int ret;
+	struct media_pad *pad;
+	struct v4l2_subdev *subdev;
+	struct hailo15_pad_stat_subscribe stat_sub;
+	struct hailo15_video_node *hailo15_vdev = video_get_drvdata(fh->vdev);
+
+	switch (sub->type) {
+	case V4L2_EVENT_CTRL:
+		ret = v4l2_ctrl_subscribe_event(fh, sub);
+		break;
+	case HAILO15_DEAMON_VIDEO_EVENT:
+		ret = v4l2_event_subscribe(fh, sub, 2, NULL);
+		break;
+	case HAILO15_UEVENT_ISP_STAT:
+		memset(&stat_sub, 0, sizeof(stat_sub));
+
+		subdev = hailo15_video_remote_subdev(hailo15_vdev);
+		if (subdev) {
+			pad = media_entity_remote_pad(&hailo15_vdev->pad);
+
+			stat_sub.pad = pad->index;
+			stat_sub.id = sub->id;
+			stat_sub.type = HAILO15_UEVENT_ISP_STAT;
+			ret = v4l2_subdev_call(subdev, core,
+					ioctl, HAILO15_PAD_STAT_SUBSCRIBE, &stat_sub);
+			if (!ret) {
+				ret = v4l2_event_subscribe(fh, sub, 8, NULL);
+			}
+		}
+		break;
+	default:
+		pr_debug("%s - got bad video event type: %u\n", __func__, sub->type);
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+static int hailo15_videoc_unsubscribe_event(struct v4l2_fh *fh,
+						const struct v4l2_event_subscription *sub)
+{
+	int ret;
+	struct media_pad *pad;
+	struct v4l2_subdev *subdev;
+	struct hailo15_pad_stat_subscribe stat_sub;
+	struct hailo15_video_node *hailo15_vdev = video_get_drvdata(fh->vdev);
+
+	switch (sub->type) {
+	case V4L2_EVENT_CTRL:
+		ret = v4l2_event_unsubscribe(fh, sub);
+		break;
+	case HAILO15_DEAMON_VIDEO_EVENT:
+		ret = v4l2_event_unsubscribe(fh, sub);
+		break;
+	case HAILO15_UEVENT_ISP_STAT:
+		memset(&stat_sub, 0, sizeof(stat_sub));
+		subdev = hailo15_video_remote_subdev(hailo15_vdev);
+		if (subdev) {
+			ret = v4l2_event_unsubscribe(fh, sub);
+			if (ret) {
+				break;
+			}
+			pad = media_entity_remote_pad(&hailo15_vdev->pad);
+			
+			stat_sub.pad = pad->index;
+			stat_sub.id = sub->id;
+			stat_sub.type = HAILO15_UEVENT_ISP_STAT;
+			ret = v4l2_subdev_call(subdev, core,
+					ioctl, HAILO15_PAD_STAT_UNSUBSCRIBE, &stat_sub);
+		}
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
 
 	return ret;
 }
@@ -594,13 +675,13 @@ static const struct v4l2_ioctl_ops video_ioctl_ops = {
 	.vidioc_qbuf = vb2_ioctl_qbuf,
 	.vidioc_dqbuf = vb2_ioctl_dqbuf,
 	.vidioc_expbuf = vb2_ioctl_expbuf,
-	.vidioc_subscribe_event = hailo15_vidioc_subscribe_event,
-	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+	.vidioc_subscribe_event = hailo15_videoc_subscribe_event,
+	.vidioc_unsubscribe_event = hailo15_videoc_unsubscribe_event,
 };
 
 static long hailo15_video_node_unlocked_ioctl(struct file *file,
-					      unsigned int cmd,
-					      unsigned long arg)
+						  unsigned int cmd,
+						  unsigned long arg)
 {
 	long ret;
 	struct hailo15_video_node *vid_node = video_drvdata(file);
@@ -619,7 +700,7 @@ static long hailo15_video_node_unlocked_ioctl(struct file *file,
 		fc = 0;
 		mutex_lock(&vid_node->ioctl_mutex);
 		ctx = v4l2_get_subdevdata(vid_node->direct_sd);
-		ret = hailo15_video_node_get_frame_count(ctx, &fc);
+		ret = hailo15_video_node_get_frame_count(ctx, vid_node->path, &fc);
 		if (ret) {
 			mutex_unlock(&vid_node->ioctl_mutex);
 			break;
@@ -629,7 +710,7 @@ static long hailo15_video_node_unlocked_ioctl(struct file *file,
 		break;
 	case VIDEO_GET_VSM_IOC:
 		ret = copy_from_user(&vsm_params, (void *)arg,
-				     sizeof(struct hailo15_get_vsm_params));
+					 sizeof(struct hailo15_get_vsm_params));
 		if (ret) {
 			ret = -EINVAL;
 			break;
@@ -677,7 +758,7 @@ static int hailo15_video_node_stream_cancel(struct hailo15_video_node *vid_node)
 		ret = hailo15_video_post_event_release_pipeline(vid_node);
 		if (ret) {
 			pr_err("%s - post event release pipeline failed\n",
-			       __func__);
+				   __func__);
 		}
 		vid_node->pipeline_init = 0;
 	}
@@ -693,7 +774,7 @@ int hailo15_video_node_open(struct file *file)
 	ret = v4l2_fh_open(file);
 	if (ret) {
 		pr_err("%s - failed to open vid_node %d\n", __func__,
-		       vid_node->id);
+			   vid_node->id);
 		return ret;
 	}
 
@@ -706,11 +787,11 @@ int hailo15_video_node_release(struct file *file)
 	int ret;
 
 	if (vid_node->streaming &&
-	    file->private_data == vid_node->queue.owner) {
+		file->private_data == vid_node->queue.owner) {
 		ret = hailo15_video_node_stream_cancel(vid_node);
 		if (ret) {
 			pr_err("%s - stream_cancel failed returning: %d\n",
-			       __func__, ret);
+				   __func__, ret);
 			return ret;
 		}
 	}
@@ -727,7 +808,7 @@ static int hailo15_video_node_mmap(struct file *file,
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct hailo15_rmem rmem;
-	struct hailo15_video_event_resource resource;
+	struct hailo15_event_resource resource;
 	unsigned long video_event_pfn;
 	unsigned long sd_event_pfn;
 	unsigned long size;
@@ -741,7 +822,7 @@ static int hailo15_video_node_mmap(struct file *file,
 
 	ctx = v4l2_get_subdevdata(vid_node->direct_sd);
 
-	ret = hailo15_video_node_get_rmem(ctx, &rmem);
+	ret = hailo15_video_node_get_rmem(ctx, vid_node->path, &rmem);
 	if (!ret) {
 		if (rmem.addr && vma->vm_pgoff == (rmem.addr >> PAGE_SHIFT)) {
 			if (vma->vm_end - vma->vm_start > rmem.size) {
@@ -755,7 +836,7 @@ static int hailo15_video_node_mmap(struct file *file,
 	}
 
 	video_event_pfn = vid_node->event_resource.phy_addr >> PAGE_SHIFT;
-	ret = hailo15_video_node_get_event_resource(ctx, &resource);
+	ret = hailo15_video_node_get_event_resource(ctx, vid_node->path, &resource);
 	sd_event_pfn = !ret ? resource.phy_addr >> PAGE_SHIFT : 0;
 	if (!ret) {
 		sd_event_valid = 1;
@@ -770,19 +851,19 @@ static int hailo15_video_node_mmap(struct file *file,
 
 		if (size > HAILO15_EVENT_RESOURCE_SIZE) {
 			pr_err("%s - not enough memory for 0x%lx size\n",
-			       __func__, size);
+				   __func__, size);
 			return -ENOMEM;
 		}
 
 		return remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff, size,
-				       vma->vm_page_prot);
+					   vma->vm_page_prot);
 	}
 
 	return vb2_fop_mmap(file, vma);
 }
 
 static unsigned int hailo15_video_node_poll(struct file *file,
-					    struct poll_table_struct *wait)
+						struct poll_table_struct *wait)
 {
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	if (vid_node->streaming) {
@@ -801,8 +882,8 @@ static struct v4l2_file_operations video_ops = {
 };
 
 static int hailo15_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
-			       unsigned int *nplanes, unsigned int sizes[],
-			       struct device *alloc_devs[])
+				   unsigned int *nplanes, unsigned int sizes[],
+				   struct device *alloc_devs[])
 {
 	struct hailo15_video_node *vid_node = queue_to_node(q);
 	const struct hailo15_video_fmt *format;
@@ -822,7 +903,7 @@ static int hailo15_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 		*nbuffers = MAX_NUM_FRAMES - q->num_buffers;
 
 	format =
-		hailo15_fourcc_get_format(vid_node->fmt.fmt.pix_mp.pixelformat);
+		hailo15_fourcc_get_format(vid_node->fmt.fmt.pix_mp.pixelformat, vid_node->fmt.fmt.pix_mp.num_planes);
 	if (!format) {
 		pr_err("%s - failed to get fourcc format\n", __func__);
 		return -EINVAL;
@@ -838,7 +919,7 @@ static int hailo15_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 			bytesperline = hailo15_plane_get_bytesperline(
 				format, line_length, plane);
 			if (sizes[plane] !=
-			    hailo15_plane_get_sizeimage(format, height,
+				hailo15_plane_get_sizeimage(format, height,
 							bytesperline, plane)) {
 				return -EINVAL;
 			}
@@ -867,7 +948,7 @@ static int hailo15_video_node_buffer_init(struct vb2_buffer *vb)
 	int plane;
 
 	memset(buf->dma, 0, sizeof(buf->dma));
-	if (vb->num_planes >= FMT_MAX_PLANES) {
+	if (vb->num_planes > FMT_MAX_PLANES) {
 		pr_info("%s - num of planes too big: %u\n", __func__,
 			vb->num_planes);
 		return -EINVAL;
@@ -910,7 +991,7 @@ static int hailo15_video_device_process_vb2_buffer(struct vb2_buffer *vb)
 
 	buf->grp_id = vid_node->path;
 	ctx = v4l2_get_subdevdata(vid_node->direct_sd);
-	return hailo15_video_node_buffer_process(ctx, buf);
+	return hailo15_video_node_buffer_process(ctx, vid_node->path, buf);
 }
 
 static void hailo15_buffer_queue(struct vb2_buffer *vb)
@@ -924,30 +1005,32 @@ static void hailo15_buffer_queue(struct vb2_buffer *vb)
 
 	if (WARN_ON(!vb) || WARN_ON(!vb->vb2_queue)) {
 		pr_err("%s - WARN_ON(!vb) || WARN_ON(!vb->vb2_queue), returning\n",
-		       __func__);
+			   __func__);
 		return;
 	}
 	/* if the list is empty, it will be called twice. */
 	if (hailo15_video_node_buffer_init(vb)) {
 		pr_err("%s - failed hailo15_video_node_buffer_init, returning\n",
-		       __func__);
+			   __func__);
 		return;
 	}
 
 	spin_lock_irqsave(&vid_node->qlock, flags);
 	if (list_empty(&vid_node->buf_queue)) {
+		if (vid_node->path == VID_GRP_P2A)
+			vid_node->skip_first_list_entry = true;
 		if (hailo15_video_device_process_vb2_buffer(vb)) {
 			spin_unlock_irqrestore(&vid_node->qlock, flags);
+			vid_node->skip_first_list_entry = false;
 			return;
 		}
 	}
 	list_add_tail(&buf->irqlist, &vid_node->buf_queue);
 	spin_unlock_irqrestore(&vid_node->qlock, flags);
 }
-
 static int hailo15_video_device_buffer_done(struct hailo15_dma_ctx *ctx,
-					    struct hailo15_buffer *buf,
-					    int grp_id)
+						struct hailo15_buffer *buf,
+						int grp_id)
 {
 	struct hailo15_video_node *vid_node;
 	unsigned long flags;
@@ -968,35 +1051,56 @@ static int hailo15_video_device_buffer_done(struct hailo15_dma_ctx *ctx,
 		return -EINVAL;
 	}
 
+	if (vid_node->path == VID_GRP_P2A) {
+		/* not isp flow, we can release buffer immediatly */
+		vid_node->prev_buf = buf;
+	}
 	if (vid_node->prev_buf) {
 		vid_node->prev_buf->vb.sequence = vid_node->sequence++;
 		vid_node->prev_buf->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb2_buffer_done(&vid_node->prev_buf->vb.vb2_buf,
 				VB2_BUF_STATE_DONE);
+		vid_node->prev_buf = NULL;
 	}
 
 	if (buf) {
 		spin_lock_irqsave(&vid_node->qlock, flags);
 		list_del(&buf->irqlist);
-		next_buffer = list_first_entry_or_null(
-			&vid_node->buf_queue, struct hailo15_buffer, irqlist);
 		spin_unlock_irqrestore(&vid_node->qlock, flags);
-
-		if (next_buffer) {
-			/* This might cost us some calculations.       */
-			/* Consider moving the queue into the context  */
-			/* for more ops efficient method               */
-			hailo15_video_device_process_vb2_buffer(
-				&next_buffer->vb.vb2_buf);
-		} else {
-			hailo15_video_node_queue_empty(ctx, vid_node->path);
-		}
 	}
 
-	vid_node->prev_buf = buf;
+	spin_lock_irqsave(&vid_node->qlock, flags);
+	next_buffer = list_first_entry_or_null(
+		&vid_node->buf_queue, struct hailo15_buffer, irqlist);
+	if (vid_node->skip_first_list_entry) {
+		if (next_buffer && !list_empty(&vid_node->buf_queue) && !list_is_singular(&vid_node->buf_queue)) {
+			next_buffer = list_next_entry(next_buffer, irqlist);
+		} else {
+			next_buffer = NULL;
+		}
+	}
+	spin_unlock_irqrestore(&vid_node->qlock, flags);
+
+	if (next_buffer) {
+		/* This might cost us some calculations.       */
+		/* Consider moving the queue into the context  */
+		/* for more ops efficient method               */
+		if (vid_node->path == VID_GRP_P2A)
+			vid_node->skip_first_list_entry = true;
+		hailo15_video_device_process_vb2_buffer(
+			&next_buffer->vb.vb2_buf);
+	} else {
+		vid_node->skip_first_list_entry = false;
+		hailo15_video_node_queue_empty(ctx, vid_node->path);
+	}
+
+	if (vid_node->path != VID_GRP_P2A) {
+		/* isp flow, we can't release the buffer yet. only in next frame */
+		vid_node->prev_buf = buf;
+	}
+
 	return 0;
 }
-
 static int hailo15_buffer_prepare(struct vb2_buffer *vb)
 {
 	struct hailo15_video_node *vid_node = queue_to_node(vb->vb2_queue);
@@ -1004,7 +1108,7 @@ static int hailo15_buffer_prepare(struct vb2_buffer *vb)
 	struct v4l2_pix_format_mplane *mfmt = &vid_node->fmt.fmt.pix_mp;
 	const struct hailo15_video_fmt *format;
 
-	format = hailo15_fourcc_get_format(mfmt->pixelformat);
+	format = hailo15_fourcc_get_format(mfmt->pixelformat, mfmt->num_planes);
 
 	if (format == NULL) {
 		pr_err("%s - returning -EINVAL\n", __func__);
@@ -1019,7 +1123,7 @@ static int hailo15_buffer_prepare(struct vb2_buffer *vb)
 		vb2_set_plane_payload(
 			vb, plane,
 			hailo15_plane_get_sizeimage(format, mfmt->height,
-						    bytesperline, plane));
+							bytesperline, plane));
 	}
 
 	return 0;
@@ -1084,7 +1188,7 @@ hailo15_video_node_queue_destroy(struct hailo15_video_node *vid_node)
 static void
 hailo15_video_node_destroy_media_entity(struct hailo15_video_node *vid_node)
 {
-	media_entity_cleanup(&vid_node->video_dev->entity);
+	hailo15_media_entity_clean(&vid_node->video_dev->entity);
 }
 
 static void
@@ -1116,13 +1220,13 @@ static void hailo15_video_node_destroy(struct hailo15_video_node *vid_node)
 	hailo15_video_node_queue_destroy(vid_node);
 	hailo15_video_node_video_device_destroy(vid_node);
 	hailo15_video_node_destroy_events(vid_node);
+	if(vid_node->id == 0){
+		hailo15_media_clean_media_device();
+	}
 }
 
 static int hailo15_video_device_destroy(struct hailo15_vid_cap_device *vid_dev)
 {
-	struct hailo15_subdev_list *tmp;
-	struct list_head *pos;
-	struct list_head *npos;
 	int video_id;
 	for (video_id = 0; video_id < MAX_VIDEO_NODE_NUM; ++video_id) {
 		if (vid_dev->vid_nodes[video_id]) {
@@ -1132,294 +1236,10 @@ static int hailo15_video_device_destroy(struct hailo15_vid_cap_device *vid_dev)
 		}
 	}
 
-	media_device_unregister(&vid_dev->mdev);
-	media_device_cleanup(&vid_dev->mdev);
-	v4l2_async_notifier_unregister(&vid_dev->subdev_notifier);
-	v4l2_async_notifier_cleanup(&vid_dev->subdev_notifier);
-	list_for_each_safe (pos, npos, &vid_dev->subdevs) {
-		tmp = list_entry(pos, struct hailo15_subdev_list, subdev_list);
-		list_del(pos);
-		kfree(tmp);
-	}
 	return 0;
 }
 
-static int hailo15_video_node_bind(struct hailo15_video_node *vid_node,
-				   struct fwnode_handle *vid_ep,
-				   struct v4l2_subdev *sd)
-{
-	struct fwnode_handle *sd_ep = NULL;
-	struct fwnode_handle *vid_remote = NULL;
-	struct fwnode_endpoint vid_remote_ep = { 0 };
-	struct v4l2_fwnode_link link;
-	struct media_entity *source, *sink;
-	unsigned int source_pad, sink_pad;
-	struct hailo15_dma_ctx *ctx;
-	int ret;
-
-	vid_remote = fwnode_graph_get_remote_endpoint(vid_ep);
-	if (!vid_remote) {
-		pr_err("Couldn't get remote endpoint for vid_node: %d endpoint: %s\n",
-		       vid_node->id, fwnode_get_name(vid_ep));
-		ret = -EINVAL;
-		goto out;
-	}
-
-	fwnode_graph_parse_endpoint(vid_remote, &vid_remote_ep);
-
-	sd_ep = fwnode_graph_get_endpoint_by_id(sd->fwnode, vid_remote_ep.port,
-						0,
-						FWNODE_GRAPH_DEVICE_DISABLED);
-	if (!sd_ep) {
-		pr_err("Couldn't get remote endpoint for sd: %s\n",
-		       fwnode_get_name(sd->fwnode));
-		ret = -EINVAL;
-		goto err_sd_ep;
-	}
-	fwnode_handle_put(vid_remote);
-
-	ret = v4l2_fwnode_parse_link(sd_ep, &link);
-	if (ret < 0) {
-		pr_err("failed to parse link for %pOF: %d\n", to_of_node(sd_ep),
-		       ret);
-		ret = -EINVAL;
-		goto out;
-	}
-	fwnode_handle_put(sd_ep);
-
-	source = &sd->entity;
-	source_pad = link.local_port;
-	sink = &vid_node->video_dev->entity;
-	sink_pad = 0;
-	v4l2_fwnode_put_link(&link);
-	ret = media_create_pad_link(source, source_pad, sink, sink_pad,
-				    MEDIA_LNK_FL_ENABLED);
-	if (ret) {
-		pr_err("failed to create %s:%u -> %s:%u link\n", source->name,
-		       source_pad, sink->name, sink_pad);
-		ret = -EINVAL;
-		goto out;
-	}
-
-	pr_debug("created %s:%u -> %s:%u link\n", source->name, source_pad,
-		 sink->name, sink_pad);
-	vid_node->direct_sd = sd;
-
-	ctx = v4l2_get_subdevdata(sd);
-	if (!ctx) {
-		pr_err("failed to get ctx from subdevdata of sd: %s\n",
-		       sd->name);
-		goto out;
-	}
-	ctx->buf_ctx.ops->buffer_done = hailo15_video_device_buffer_done;
-	hailo15_video_node_set_private_data(ctx, vid_node->path,
-					    (void *)vid_node);
-	goto out;
-
-err_sd_ep:
-	fwnode_handle_put(vid_remote);
-out:
-	return ret;
-}
-
-static int
-hailo15_video_node_notifier_bound(struct v4l2_async_notifier *notifier,
-				  struct v4l2_subdev *source_subdev,
-				  struct v4l2_async_subdev *asd)
-{
-	struct hailo15_vid_cap_device *vid_dev = container_of(
-		notifier, struct hailo15_vid_cap_device, subdev_notifier);
-	struct hailo15_subdev_list *new_entry =
-		kzalloc(sizeof(struct hailo15_subdev_list), GFP_KERNEL);
-	new_entry->subdev = source_subdev;
-	list_add(&new_entry->subdev_list, &vid_dev->subdevs);
-	return 0;
-}
-
-static void
-hailo15_video_node_notifier_unbind(struct v4l2_async_notifier *notifier,
-				   struct v4l2_subdev *sd,
-				   struct v4l2_async_subdev *asd)
-{
-	struct hailo15_vid_cap_device *vid_dev = container_of(
-		notifier, struct hailo15_vid_cap_device, subdev_notifier);
-	int i;
-	for (i = 0; i < MAX_VIDEO_NODE_NUM; ++i) {
-		if (vid_dev->vid_nodes[i]) {
-			media_entity_remove_links(
-				&vid_dev->vid_nodes[i]->video_dev->entity);
-		}
-	}
-}
-
-static int hailo15_bind_sd2remote(struct media_entity *sd_entity,
-				  struct media_entity *remote_entity,
-				  struct fwnode_handle *remote_ep)
-{
-	struct media_entity *source, *sink;
-	struct v4l2_fwnode_link link;
-	unsigned int source_pad, sink_pad;
-	int ret;
-
-	ret = v4l2_fwnode_parse_link(remote_ep, &link);
-	if (ret < 0) {
-		pr_err("failed to parse link for remote_ep %s\n",
-		       fwnode_get_name(remote_ep));
-		ret = -EINVAL;
-		goto out;
-	}
-
-	// check which entity is the sink and which is the source for the link
-	if ((sd_entity->pads[link.local_port].flags & MEDIA_PAD_FL_SOURCE)) {
-		source = sd_entity;
-		source_pad = link.local_port;
-		sink = remote_entity;
-		sink_pad = link.remote_port;
-	} else {
-		source = remote_entity;
-		source_pad = link.remote_port;
-		sink = sd_entity;
-		sink_pad = link.local_port;
-	}
-
-	if (media_entity_find_link(&source->pads[source_pad],
-				   &sink->pads[sink_pad])) {
-		pr_info("%s - link already exists, return successfuly\n",
-			__func__);
-		goto out;
-	}
-
-	ret = media_create_pad_link(source, source_pad, sink, sink_pad,
-				    MEDIA_LNK_FL_ENABLED);
-	if (ret) {
-		pr_err("failed to create %s:%u -> %s:%u link\n", source->name,
-		       source_pad, sink->name, sink_pad);
-		ret = -EINVAL;
-	}
-
-	pr_debug("created %s:%u -> %s:%u link\n", source->name, source_pad,
-		 sink->name, sink_pad);
-
-out:
-	return ret;
-}
-
-static int hailo15_find_remote_in_subdev_list(struct fwnode_handle *ep,
-					      struct list_head *subdevs,
-					      struct v4l2_subdev **o_subdev)
-{
-	struct fwnode_handle *remote_fwnode;
-	struct hailo15_subdev_list *remote_list;
-
-	remote_fwnode = fwnode_graph_get_remote_port_parent(ep);
-	if (!remote_fwnode) {
-		pr_err("failed to get remote port parent of %s\n",
-		       fwnode_get_name(ep));
-		return -1;
-	}
-
-	// look for the remote node of the video node in the subdevs list to create a link between them
-	list_for_each_entry (remote_list, subdevs, subdev_list) {
-		if (remote_list->subdev->fwnode == remote_fwnode) {
-			*o_subdev = remote_list->subdev;
-			fwnode_handle_put(remote_fwnode);
-			return 0;
-		}
-	}
-	fwnode_handle_put(remote_fwnode);
-	return -1;
-}
-
-static int
-hailo15_video_node_notifier_complete(struct v4l2_async_notifier *notifier)
-{
-	struct hailo15_vid_cap_device *vid_dev = container_of(
-		notifier, struct hailo15_vid_cap_device, subdev_notifier);
-	struct hailo15_video_node *vid_node;
-	struct fwnode_handle *ep;
-	struct hailo15_subdev_list *remote_list;
-	struct v4l2_subdev *found_sd;
-	int i;
-	int found;
-	int ret;
-
-	// bind video nodes to their subdevs
-	for (i = 0; i < MAX_VIDEO_NODE_NUM; ++i) {
-		remote_list = NULL;
-		ep = NULL;
-		if (vid_dev->vid_nodes[i]) {
-			vid_node = vid_dev->vid_nodes[i];
-
-			ep = fwnode_graph_get_endpoint_by_id(
-				dev_fwnode(vid_node->dev), vid_node->id, 0,
-				FWNODE_GRAPH_DEVICE_DISABLED);
-			if (!ep) {
-				pr_err("failed to get endpoint 0 of node %d, skipping...\n",
-				       vid_node->id);
-				continue;
-			}
-
-			found_sd = NULL;
-			found = hailo15_find_remote_in_subdev_list(
-				ep, &vid_dev->subdevs, &found_sd);
-			if (found == -1)
-				continue;
-
-			ret = hailo15_video_node_bind(vid_node, ep, found_sd);
-			if (ret) {
-				pr_err("failed to bind node %d, skipping...\n",
-				       vid_node->id);
-				goto err_bind;
-			}
-		}
-	}
-
-	// in case some of the subdevs need to get bound to their own subdevs - create those links
-	list_for_each_entry (remote_list, &vid_dev->subdevs, subdev_list) {
-		// go over all endpoints of the subdev and look for their remote endpoint in the video device's subdevs list
-		while ((ep = fwnode_graph_get_next_endpoint(
-				remote_list->subdev->fwnode, ep))) {
-			found_sd = NULL;
-			found = hailo15_find_remote_in_subdev_list(
-				ep, &vid_dev->subdevs, &found_sd);
-			if (found == -1)
-				continue;
-
-			ret = hailo15_bind_sd2remote(
-				&remote_list->subdev->entity, &found_sd->entity,
-				ep);
-			if (ret) {
-				pr_err("failed to bind subdev %s to subdev %s\n",
-				       remote_list->subdev->name,
-				       found_sd->name);
-				goto err_bind;
-			}
-		}
-	}
-
-	ret = media_device_register(&vid_dev->mdev);
-	if (ret) {
-		pr_err("failed to init media device err=%d\n", ret);
-		goto err_media_device_register;
-	}
-
-	goto out;
-
-err_media_device_register:
-err_bind:
-	hailo15_video_device_destroy(vid_dev);
-	kfree(vid_dev);
-out:
-	fwnode_handle_put(ep);
-	return v4l2_device_register_subdev_nodes(vid_node->v4l2_dev);
-}
-
-static const struct v4l2_async_notifier_operations sd_async_notifier_ops = {
-	.bound = hailo15_video_node_notifier_bound,
-	.unbind = hailo15_video_node_notifier_unbind,
-	.complete = hailo15_video_node_notifier_complete,
-};
-
+	
 static const struct media_entity_operations hailo15_video_media_ops = {
 	.link_validate = v4l2_subdev_link_validate,
 };
@@ -1466,7 +1286,7 @@ hailo15_video_node_init_media_entity(struct hailo15_video_node *vid_node)
 
 	vid_node->pad.flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
 	return media_entity_pads_init(&vid_node->video_dev->entity, 1,
-				      &vid_node->pad);
+					  &vid_node->pad);
 }
 
 static int
@@ -1528,7 +1348,7 @@ hailo15_video_node_video_device_register(struct hailo15_video_node *vid_node)
 	if (WARN_ON(!vid_node))
 		return -EINVAL;
 	return video_register_device(vid_node->video_dev, VFL_TYPE_VIDEO,
-				     vid_node->id);
+					 vid_node->id);
 }
 
 static int
@@ -1551,15 +1371,22 @@ hailo15_video_node_init_v4l2_device(struct hailo15_video_node *vid_node)
 		goto err_v4l2_device_register;
 	}
 
-	ret = v4l2_device_register_subdev_nodes(vid_node->v4l2_dev);
-	if (ret) {
-		pr_err("%sFailed registering the subdevs with code %d \n",
-		       __func__, ret);
+	vid_node->video_dev->v4l2_dev = vid_node->v4l2_dev;
+	vid_node->v4l2_dev->mdev = vid_node->mdev;
+
+	ret = hailo15_media_register_v4l2_device(vid_node->v4l2_dev, vid_node->id);
+	if(ret){
+		pr_err("failed to register v4l2 device\n");
 		goto err_register_subdev_nodes;
 	}
 
-	vid_node->video_dev->v4l2_dev = vid_node->v4l2_dev;
-	vid_node->v4l2_dev->mdev = vid_node->mdev;
+	ret = v4l2_device_register_subdev_nodes(vid_node->v4l2_dev);
+	if (ret) {
+		pr_err("%sFailed registering the subdevs with code %d \n",
+			   __func__, ret);
+		goto err_register_subdev_nodes;
+	}
+
 
 	goto out;
 
@@ -1597,6 +1424,10 @@ static int hailo15_video_node_init_events(struct hailo15_video_node *vid_node)
 static int hailo15_video_node_init(struct hailo15_video_node *vid_node)
 {
 	int ret;
+	
+	if(vid_node->id == 0){
+		hailo15_media_init_media_device(vid_node->dev);
+	}
 
 	ret = hailo15_video_node_video_device_init(vid_node);
 	if (ret) {
@@ -1635,19 +1466,22 @@ static int hailo15_video_node_init(struct hailo15_video_node *vid_node)
 		goto err_video_register;
 	}
 
+	ret = hailo15_media_create_links(vid_node->dev, &vid_node->video_dev->entity, vid_node->id);
+	if(ret){
+		dev_err(vid_node->dev, "can't create media links for node %d\n", vid_node->id);
+		goto err_create_links;
+	}
+
 	ret = hailo15_video_node_init_events(vid_node);
 	if (ret) {
 		dev_err(vid_node->dev, "can't init events for node %d\n",
 			vid_node->id);
-		goto err_video_register;
+		goto err_create_links;
 	}
 	goto out;
 
-/* TODO: MSW-2716: This code section is unused */
-/*
-err_async_notifier:
+err_create_links:
 	hailo15_video_node_video_device_unregister(vid_node);
-*/
 err_video_register:
 	hailo15_video_node_destroy_v4l2_device(vid_node);
 err_v4l2_device:
@@ -1663,16 +1497,16 @@ static int hailo15_video_init_vid_nodes(struct hailo15_vid_cap_device *vid_dev)
 {
 	struct hailo15_video_node *vid_node = NULL;
 	struct fwnode_handle *ep = NULL;
-	struct fwnode_handle *remote_ep;
-	struct v4l2_async_subdev *asd;
+	struct v4l2_subdev* sd;
 	int i = 0;
 	uint32_t path;
 	int ret;
 	struct fwnode_endpoint fwnode_ep;
+	struct hailo15_dma_ctx* ctx;
 
 	while (i++ < MAX_VIDEO_NODE_NUM) {
 		ep = fwnode_graph_get_next_endpoint(dev_fwnode(vid_dev->dev),
-						    ep);
+							ep);
 		if (!ep)
 			break;
 
@@ -1682,42 +1516,16 @@ static int hailo15_video_init_vid_nodes(struct hailo15_vid_cap_device *vid_dev)
 		ret = fwnode_graph_parse_endpoint(ep, &fwnode_ep);
 		if (ret) {
 			pr_err("failed to parse endpoint %d, skipping...",
-			       i - 1);
+				   i - 1);
 			fwnode_handle_put(ep);
 			continue;
 		}
 
 		VIDEO_INDEX_VALIDATE(fwnode_ep.port, ret = -EINVAL;
-				     goto err_invalid_port);
+					 goto err_invalid_port);
 
 		pr_info("%s - parsed video endpoint with port: %d, id: %d\n",
 			__func__, fwnode_ep.port, fwnode_ep.id);
-
-		remote_ep = fwnode_graph_get_remote_endpoint(ep);
-		if (!remote_ep) {
-			pr_err("failed to get remote endpoint for endpoint %d, skipping...\n",
-			       i - 1);
-			fwnode_handle_put(remote_ep);
-			continue;
-		}
-		fwnode_handle_put(remote_ep);
-
-		// local and remote ep exist - add remote subdev to notifier asd list
-		asd = v4l2_async_notifier_add_fwnode_remote_subdev(
-			&vid_dev->subdev_notifier, ep,
-			struct v4l2_async_subdev);
-		if (IS_ERR(asd)) {
-			if (PTR_ERR(asd) == -EEXIST) {
-				pr_debug(
-					"async subdev for remote of %s - already added to a notifier, continue...",
-					fwnode_get_name(ep));
-			} else {
-				pr_err("failed to add remote subdev to notifier! %ld\n",
-				       PTR_ERR(asd));
-				ret = PTR_ERR(asd);
-				goto err_notifier_add;
-			}
-		}
 
 		// initialize video node
 		vid_node =
@@ -1727,18 +1535,19 @@ static int hailo15_video_init_vid_nodes(struct hailo15_vid_cap_device *vid_dev)
 			goto err_node_alloc;
 		}
 
-		vid_node->asd = asd;
 		vid_node->dev = vid_dev->dev;
-		vid_node->mdev = &vid_dev->mdev;
+		vid_node->mdev = hailo15_media_get_media_device();
 
 		// node id taken from port property of the endpoint (assumes one endpoint per port)
 		vid_node->id = fwnode_ep.port;
+
+		vid_node->prev_buf = NULL;
 
 		// read path property so s_stream knows from where it was called
 		ret = fwnode_property_read_u32(ep, "path", &path);
 		if (ret || path >= VID_GRP_MAX) {
 			pr_err("failed to read path property from video node %d, skipping...\n",
-			       fwnode_ep.port);
+				   fwnode_ep.port);
 			kfree(vid_node);
 			continue;
 		}
@@ -1747,36 +1556,31 @@ static int hailo15_video_init_vid_nodes(struct hailo15_vid_cap_device *vid_dev)
 		ret = hailo15_video_node_init(vid_node);
 		if (ret) {
 			pr_err("failed to init video node %d, skipping...\n",
-			       fwnode_ep.port);
+				   fwnode_ep.port);
 			kfree(vid_node);
 			continue;
 		}
 
 		vid_dev->vid_nodes[vid_node->id] = vid_node;
-		pr_info("vid_node %d initialized successfully\n", vid_node->id);
-	}
 
-	// find the first node that exists and use its v4l2_device to register the notifier
-	for (i = 0; i < MAX_VIDEO_NODE_NUM; ++i) {
-		if (vid_dev->vid_nodes[i]) {
-			ret = v4l2_async_notifier_register(
-				vid_node->v4l2_dev, &vid_dev->subdev_notifier);
-			if (ret) {
-				pr_err("failed to register notifier\n");
-				goto err_register_notifier;
-			}
-			break;
+		ret = hailo15_media_get_subdev(vid_node->dev, vid_node->id, &sd);
+		if(ret){
+			pr_err("vid_node %d failed to get subdevice\n", vid_node->id);
+			goto err_node_alloc;
 		}
+
+		vid_node->direct_sd = sd;
+		ctx = v4l2_get_subdevdata(sd);
+		ctx->buf_ctx[vid_node->path].ops->buffer_done = hailo15_video_device_buffer_done;
+		hailo15_video_node_set_private_data(ctx, vid_node->path,
+		                                           (void *)vid_node);
+
+		pr_info("vid_node %d initialized successfully\n", vid_node->id);
+		
 	}
 
-	if (i == MAX_VIDEO_NODE_NUM) {
-		pr_err("no video node initialized\n");
-		ret = -EINTR;
-		goto err_register_notifier;
-	}
 	goto out;
 
-err_register_notifier:
 err_node_alloc:
 	for (i = 0; i < MAX_VIDEO_NODE_NUM; ++i) {
 		if (vid_dev->vid_nodes[i]) {
@@ -1785,7 +1589,6 @@ err_node_alloc:
 		}
 	}
 err_invalid_port:
-err_notifier_add:
 	fwnode_handle_put(ep);
 out:
 	return ret;
@@ -1795,7 +1598,13 @@ static int hailo15_video_probe(struct platform_device *pdev)
 {
 	int ret;
 	struct hailo15_vid_cap_device *vid_dev;
+	
+	ret = hailo15_media_get_endpoints_status(&pdev->dev);
 
+	if(ret){
+		return ret;
+	}
+	
 	vid_dev = kzalloc(sizeof(struct hailo15_vid_cap_device), GFP_KERNEL);
 	if (!vid_dev) {
 		pr_err("failed to allocate vid cap device\n");
@@ -1805,15 +1614,6 @@ static int hailo15_video_probe(struct platform_device *pdev)
 	vid_dev->dev = &pdev->dev;
 
 	platform_set_drvdata(pdev, vid_dev);
-
-	strscpy(vid_dev->mdev.model, "hailo_media",
-		sizeof(vid_dev->mdev.model));
-	vid_dev->mdev.dev = &pdev->dev;
-	media_device_init(&vid_dev->mdev);
-
-	INIT_LIST_HEAD(&vid_dev->subdevs);
-	v4l2_async_notifier_init(&vid_dev->subdev_notifier);
-	vid_dev->subdev_notifier.ops = &sd_async_notifier_ops;
 
 	ret = hailo15_video_init_vid_nodes(vid_dev);
 	if (ret) {
@@ -1826,9 +1626,6 @@ static int hailo15_video_probe(struct platform_device *pdev)
 	goto out;
 	pr_debug("video device probe success\n");
 err_init_nodes:
-	media_device_cleanup(&vid_dev->mdev);
-	v4l2_async_notifier_unregister(&vid_dev->subdev_notifier);
-	v4l2_async_notifier_cleanup(&vid_dev->subdev_notifier);
 	kfree(vid_dev);
 out:
 	return ret;

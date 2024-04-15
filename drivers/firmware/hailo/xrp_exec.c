@@ -16,6 +16,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/timekeeping.h>
 
 bool support_shadow_copy = true;
 module_param(support_shadow_copy, bool, 0644);
@@ -372,13 +373,15 @@ static long xrp_complete_hw_request(struct xvp *xvp, struct xrp_dsp_cmd __iomem 
     return 0;
 }
 
-
 long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
 {
     struct xvp *xvp = filp->private_data;
     struct xrp_comm *queue = xvp->queue;
     struct xrp_request *rq;
     long ret = 0;
+    ktime_t dsp_start_time, dsp_end_time;
+    uint64_t dsp_command_time_us;
+    uint8_t current_threads;
     
     rq = kzalloc(sizeof(struct xrp_request), GFP_KERNEL);
     if (!rq) {
@@ -410,7 +413,15 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
             __func__, n, queue->priority);
     }
 
+    atomic_inc(&xvp->stats.current_threads);
     mutex_lock(&queue->lock);
+
+    // we've aquired the mutex
+    // further statistics accesses don't have to be atomic
+    current_threads = atomic_read(&xvp->stats.current_threads);
+    if (current_threads > xvp->stats.max_threads) {
+        xvp->stats.max_threads = current_threads;
+    }
 
     ret = xrp_map_request(filp, rq, current->mm);
     if (ret < 0) {
@@ -422,13 +433,22 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
 
     xrp_send_device_irq(xvp);
 
+    dsp_start_time = ktime_get();
     ret = xrp_wait_for_cmd_completion(xvp, queue);
     if (ret != 0) {
         dev_err(xvp->dev, "%s: failed waiting for command %ld\n", __func__, ret);
         goto mutex_err;
     }
+    dsp_end_time = ktime_get();
 
     dev_dbg(xvp->dev, "%s: cmd completed", __func__);
+
+    dsp_command_time_us = ktime_us_delta(dsp_end_time, dsp_start_time);
+    if (dsp_command_time_us > xvp->stats.max_dsp_time_us) {
+        xvp->stats.max_dsp_time_us = dsp_command_time_us;
+    }
+    xvp->stats.total_dsp_time_us += dsp_command_time_us;
+    xvp->stats.total_dsp_commands++;
 
     /* copy back inline data */
     ret = xrp_complete_hw_request(xvp, queue->comm, rq);
@@ -447,8 +467,50 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
 
 mutex_err:
     mutex_unlock(&queue->lock);
+    atomic_dec(&xvp->stats.current_threads);
 err:
     kfree(rq);
 
     return ret;
+}
+
+long xrp_ioctl_get_stats(struct file *filp, struct xrp_ioctl_stats __user *p)
+{
+    struct xvp *xvp = filp->private_data;
+    struct xrp_ioctl_stats xrp_ioctl_stats;
+
+    if (copy_from_user(&xrp_ioctl_stats, p, sizeof(*p))) {
+        dev_err(xvp->dev, "%s: copy_from_user() failed\n", __func__);
+        return -EFAULT;
+    }
+
+    // I set this before acquiring the mutex to avoid acquisition after all
+    // threads are done and thus always getting 0 current threads
+    xrp_ioctl_stats.current_threads_using_dsp =
+	    atomic_read(&xvp->stats.current_threads);
+
+    mutex_lock(&xvp->queue->lock);
+
+    if (xrp_ioctl_stats.reset) {
+	    xvp->stats.total_dsp_time_us = 0;
+	    xvp->stats.max_dsp_time_us = 0;
+	    xvp->stats.total_dsp_commands = 0;
+	    xvp->stats.max_threads = 0;
+
+	    mutex_unlock(&xvp->queue->lock);
+    } else {
+	    xrp_ioctl_stats.total_dsp_time_us = xvp->stats.total_dsp_time_us;
+	    xrp_ioctl_stats.max_dsp_command_time_us = xvp->stats.max_dsp_time_us;
+	    xrp_ioctl_stats.max_threads_using_dsp = xvp->stats.max_threads;
+	    xrp_ioctl_stats.total_dsp_commands = xvp->stats.total_dsp_commands;
+
+	    mutex_unlock(&xvp->queue->lock);
+
+	    if (copy_to_user(p, &xrp_ioctl_stats, sizeof(*p))) {
+		    dev_err(xvp->dev, "%s: copy_to_user() failed\n", __func__);
+		    return -EFAULT;
+	    }
+    }
+
+    return 0;
 }

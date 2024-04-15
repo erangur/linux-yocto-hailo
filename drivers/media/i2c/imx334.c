@@ -25,6 +25,7 @@
 
 /* Lines per frame */
 #define IMX334_REG_LPFR		0x3030
+#define IMX334_MAX_LPFR_4K (1 << 20) - 2 - 2160 // max even value of unsigned 20bit - 4k #lines
 
 /* Chip ID */
 #define IMX334_REG_ID		0x3044
@@ -353,7 +354,7 @@ static const struct imx334_mode supported_modes[] = {
 	.hblank = 560,
 	.vblank = 2340,
 	.vblank_min = 90,
-	.vblank_max = 132840,
+	.vblank_max = IMX334_MAX_LPFR_4K,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_1X12,
@@ -372,7 +373,7 @@ static const struct imx334_mode supported_modes[] = {
 	.hblank = 560,
 	.vblank = 90,
 	.vblank_min = 90,
-	.vblank_max = 132840,
+	.vblank_max = IMX334_MAX_LPFR_4K,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_1X12,
@@ -391,7 +392,7 @@ static const struct imx334_mode supported_modes[] = {
 	.hblank = 560,
 	.vblank = 6840,
 	.vblank_min = 90,
-	.vblank_max = 132840,
+	.vblank_max = IMX334_MAX_LPFR_4K,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_1X12,
@@ -550,6 +551,11 @@ static int imx334_update_exp_gain(struct imx334 *imx334, u32 exposure, u32 gain)
 {
 	u32 lpfr, shutter;
 	int ret;
+
+	if(imx334->vblank + imx334->cur_mode->height - IMX334_EXPOSURE_OFFSET <= exposure)
+		imx334->vblank = exposure - imx334->cur_mode->height + IMX334_EXPOSURE_OFFSET;
+	else
+		imx334->vblank = imx334->cur_mode->vblank;
 
 	lpfr = imx334->vblank + imx334->cur_mode->height;
 	shutter = lpfr - exposure;
@@ -718,7 +724,7 @@ static int imx334_set_ctrl(struct v4l2_ctrl *ctrl)
 
 		ret = __v4l2_ctrl_modify_range(imx334->exp_ctrl,
 					       IMX334_EXPOSURE_MIN,
-					       imx334->vblank +
+					       imx334->cur_mode->vblank_max +
 					       imx334->cur_mode->height -
 					       IMX334_EXPOSURE_OFFSET,
 					       1, IMX334_EXPOSURE_DEFAULT);
@@ -1309,7 +1315,7 @@ static int imx334_init_controls(struct imx334 *imx334)
 	ctrl_hdlr->lock = &imx334->mutex;
 
 	/* Initialize exposure and gain */
-	lpfr = mode->vblank + mode->height;
+	lpfr = mode->vblank_max + mode->height;
 	imx334->exp_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
 					     &imx334_ctrl_ops,
 					     V4L2_CID_EXPOSURE,

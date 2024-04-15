@@ -77,6 +77,14 @@ struct comm_buffer {
   size_t size;
 };
 
+struct stats {
+    uint64_t total_dsp_time_us;
+    uint64_t max_dsp_time_us;
+    uint32_t total_dsp_commands;
+    atomic_t current_threads;
+    uint8_t max_threads;
+};
+
 struct xvp {
     struct device *dev;
     const char *firmware_name;
@@ -109,6 +117,8 @@ struct xvp {
 
     spinlock_t busy_list_lock;
     struct xrp_allocation *busy_list;
+
+    struct stats stats;
 };
 
 #endif

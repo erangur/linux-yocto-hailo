@@ -53,6 +53,17 @@
      };
 };
 
+&i2c_1 {
+    gyro_lsm6dsr_1: lsm6dsr_1@6b {
+        compatible = "st,lsm6dsr";
+        reg = <0x6b>;
+        vdd-supply = <&regulator_3p3v>;
+        vddio-supply = <&regulator_3p3v>;
+        interrupt-parent = <&gpio1>;
+        interrupts = <14 IRQ_TYPE_EDGE_RISING>;
+	};
+};
+
 &sdio0 {
     broken-cd;
 };

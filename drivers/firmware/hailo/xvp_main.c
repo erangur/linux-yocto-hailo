@@ -196,6 +196,11 @@ static long xvp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             filp, (struct xrp_ioctl_sync_buffer __user *)arg);
         break;
 
+    case XRP_IOCTL_STATS:
+        dev_dbg(xvp->dev, "%s: XRP_IOCTL_STATS\n", __func__);
+        retval = xrp_ioctl_get_stats(filp, (struct xrp_ioctl_stats __user *)arg);
+        break;
+
     default:
         dev_err(xvp->dev, "%s: Unknown command (%d)\n", __func__, cmd);
         retval = -EINVAL;

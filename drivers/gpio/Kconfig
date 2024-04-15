@@ -138,6 +138,7 @@ config GPIO_ALTERA
 config GPIO_CMSDK
 	tristate "ARM CoreLink CMSDK GPIO support"
 	select IRQ_DOMAIN
+	select GENERIC_IRQ_CHIP
 	select GPIOLIB_IRQCHIP
 	help
 	  Say yes here to support the ARM CoreLink CMSDK GPIO device

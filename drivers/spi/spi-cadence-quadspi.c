@@ -29,7 +29,8 @@
 #include <linux/spi/spi-mem.h>
 #include <linux/timer.h>
 #include <linux/bitrev.h>
-#include <asm/neon-intrinsics.h>
+#include <asm/neon.h>
+#include "spi-cadence-quadspi-neon.h"
 
 #define CQSPI_NAME			"cadence-qspi"
 #define CQSPI_MAX_CHIPSELECT		16
@@ -42,7 +43,14 @@
 
 /* Capabilities */
 #define CQSPI_SUPPORTS_OCTAL		BIT(0)
-
+#define CQSPI_SUPPORTS_SPI_MODE_0	BIT(1)
+#define CQSPI_SUPPORTS_SPI_MODE_1	BIT(2)
+#define CQSPI_SUPPORTS_SPI_MODE_2	BIT(3)
+#define CQSPI_SUPPORTS_SPI_MODE_3	BIT(4)
+#define CQSPI_SUPPORTS_SPI_MODE_ALL (CQSPI_SUPPORTS_SPI_MODE_0 | \
+								CQSPI_SUPPORTS_SPI_MODE_1 | \
+								CQSPI_SUPPORTS_SPI_MODE_2 | \
+								CQSPI_SUPPORTS_SPI_MODE_3)
 struct cqspi_st;
 
 struct cqspi_flash_pdata {
@@ -76,6 +84,7 @@ struct cqspi_st {
 	dma_addr_t		mmap_phys_base;
 
 	int			current_cs;
+	int			irq;
 	unsigned long		master_ref_clk_hz;
 	bool			is_decoded_cs;
 	u32			fifo_depth;
@@ -92,6 +101,11 @@ struct cqspi_st {
 	void		*rx_buf;
 
 	struct cqspi_flash_pdata f_pdata[CQSPI_MAX_CHIPSELECT];
+	/* 
+	  Whether the HW auto poll for completion of the transfer is enabled. 
+	  If true, the controller will hold the bus while wrtiting to poll for completion.
+	*/
+	bool is_auto_poll_enabled;
 };
 
 struct cqspi_driver_platdata {
@@ -123,6 +137,8 @@ struct cqspi_driver_platdata {
 /* Register map */
 #define CQSPI_REG_CONFIG			0x00
 #define CQSPI_REG_CONFIG_ENABLE_MASK		BIT(0)
+#define CQSPI_REG_CONFIG_CPHA_MASK		BIT(1)
+#define CQSPI_REG_CONFIG_CPOL_MASK		BIT(2)
 #define CQSPI_REG_CONFIG_ENB_DIR_ACC_CTRL	BIT(7)
 #define CQSPI_REG_CONFIG_LEGACY_MODE		BIT(8)
 #define CQSPI_REG_CONFIG_DECODE_MASK		BIT(9)
@@ -193,6 +209,8 @@ struct cqspi_driver_platdata {
 #define CQSPI_REG_SDRAMLEVEL_RD_MASK		0xFFFF
 #define CQSPI_REG_SDRAMLEVEL_WR_MASK		0xFFFF
 
+#define CQSPI_REG_RX_THRESHOLD			0x34
+
 #define CQSPI_REG_WR_COMPLETION_CTRL		0x38
 #define CQSPI_REG_WR_DISABLE_AUTO_POLL		BIT(14)
 
@@ -255,6 +273,7 @@ struct cqspi_driver_platdata {
 #define CQSPI_REG_IRQ_WR_PROTECTED_ERR		BIT(4)
 #define CQSPI_REG_IRQ_ILLEGAL_AHB_ERR		BIT(5)
 #define CQSPI_REG_IRQ_WATERMARK			BIT(6)
+#define CQSPI_REG_IRQ_SMALL_RX_FIFO_NOT_EMPTY		BIT(10)
 #define CQSPI_REG_IRQ_IND_SRAM_FULL		BIT(12)
 
 #define CQSPI_IRQ_MASK_RD		(CQSPI_REG_IRQ_WATERMARK	| \
@@ -266,6 +285,13 @@ struct cqspi_driver_platdata {
 					 CQSPI_REG_IRQ_UNDERFLOW)
 
 #define CQSPI_IRQ_STATUS_MASK		0x1FFFF
+
+/* we want to get the interrupt when it reaches 8 bytes.
+   according to the documentation, the "Small RX FIFO not empty" interrupt rises when
+   "FIFO has at least RX THRESHOLD entires", but in fact it is when it has more than RX THRESHOLD entires. */
+#define CQSPI_RX_THRESHOLD_VALUE			7
+#define CQSPI_RX_THRESHOLD_MAX			0x1F
+
 
 static int cqspi_wait_for_bit(void __iomem *reg, const u32 mask, bool clr)
 {
@@ -836,7 +862,10 @@ static int cqspi_write_setup(struct cqspi_flash_pdata *f_pdata,
 	 * care of polling the status register.
 	 */
 	reg = readl(reg_base + CQSPI_REG_WR_COMPLETION_CTRL);
-	reg |= CQSPI_REG_WR_DISABLE_AUTO_POLL;
+	if (cqspi->is_auto_poll_enabled)
+		reg &= ~CQSPI_REG_WR_DISABLE_AUTO_POLL;
+	else
+		reg |= CQSPI_REG_WR_DISABLE_AUTO_POLL;
 	writel(reg, reg_base + CQSPI_REG_WR_COMPLETION_CTRL);
 
 	reg = readl(reg_base + CQSPI_REG_SIZE);
@@ -1236,19 +1265,65 @@ static int cqspi_mem_process(struct spi_mem *mem, const struct spi_mem_op *op)
 	return cqspi_write(f_pdata, op);
 }
 
+/**
+ * cqspi_clock_mode_setup - Control QSPI controller legacy mode operation.
+ * @cqspi: 	Pointer to quad spi controller (struct cqspi_st)
+ * @enable: true (Enable legacy mode operation), false (Disbale legacy mode operation).
+ */
+int cqspi_legacy_mode_ctrl(struct cqspi_st *cqspi, bool enable)
+{
+	u32 ctrl_reg, new_ctrl_reg;
+
+	ctrl_reg = readl(cqspi->iobase + CQSPI_REG_CONFIG);
+	new_ctrl_reg = ctrl_reg;
+
+	if (enable) {
+		/* move to legacy mode */
+		new_ctrl_reg |= CQSPI_REG_CONFIG_LEGACY_MODE;
+	} else {
+		/* exit from legacy mode */
+		new_ctrl_reg &= ~CQSPI_REG_CONFIG_LEGACY_MODE;
+	}
+	if (new_ctrl_reg != ctrl_reg) {
+		writel(new_ctrl_reg, cqspi->iobase + CQSPI_REG_CONFIG);
+	}
+
+	return 0;
+}
+
+/**
+ * cqspi_clock_mode_setup - Setup QSPI controller SPI mode (Clock polarity,phase)
+ * @cqspi: 	Pointer to quad spi controller (struct cqspi_st)
+ * @mode: spi device mode
+ */
+static void cqspi_clock_mode_setup(struct cqspi_st *cqspi, u32 mode)
+{
+	u32 ctrl_reg, new_ctrl_reg;
+
+	ctrl_reg = readl(cqspi->iobase + CQSPI_REG_CONFIG);
+	new_ctrl_reg = ctrl_reg;
+
+	/* Set the QSPI clock phase and clock polarity */
+	new_ctrl_reg &= ~(CQSPI_REG_CONFIG_CPHA_MASK | CQSPI_REG_CONFIG_CPOL_MASK);
+	if (mode & SPI_CPHA)
+		new_ctrl_reg |= CQSPI_REG_CONFIG_CPHA_MASK;
+	if (mode & SPI_CPOL)
+		new_ctrl_reg |= CQSPI_REG_CONFIG_CPOL_MASK;
+
+	if (new_ctrl_reg != ctrl_reg) {
+		writel(new_ctrl_reg, cqspi->iobase + CQSPI_REG_CONFIG);
+	}
+}
+
 static int cqspi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 {
 	struct cqspi_st *cqspi = spi_master_get_devdata(mem->spi->master);
 	int ret;
-	unsigned int reg;
 
-	reg = readl(cqspi->iobase + CQSPI_REG_CONFIG);
-	if (reg & CQSPI_REG_CONFIG_LEGACY_MODE) {
-		/* move to non-legacy mode */
-		reg &= ~CQSPI_REG_CONFIG_LEGACY_MODE;
-		writel(reg, cqspi->iobase + CQSPI_REG_CONFIG);
-	}
-
+	/* Set QSPI controller to non-legacy mode */
+	cqspi_legacy_mode_ctrl(cqspi, false);
+	/* Setup QSPI controller SPI mode according to SPI traget device */
+	cqspi_clock_mode_setup(cqspi, mem->spi->mode);
 	ret = cqspi_mem_process(mem, op);
 	if (ret)
 		dev_err(&mem->spi->dev, "operation failed with %d\n", ret);
@@ -1351,6 +1426,7 @@ static int cqspi_of_get_pdata(struct cqspi_st *cqspi)
 		cqspi->small_fifo_size = CQSPI_DEFAULT_SMALL_FIFO_SIZE;
 	}
 
+	cqspi->is_auto_poll_enabled = of_property_read_bool(np, "cdns,enable-auto-poll");
 	cqspi->rclk_en = of_property_read_bool(np, "cdns,rclk-en");
 
 	return 0;
@@ -1361,12 +1437,37 @@ static int cqspi_of_get_pdata(struct cqspi_st *cqspi)
  */
 static u8 *cqspi_spi_read_small_rx_fifo(struct cqspi_st *cqspi, u8 *rx_buf, int rx_len)
 {
+	unsigned int irq_status;
+
 	cqspi->remaining_message_rx_bytes -= rx_len;
 
 	while (rx_len >= 8) {
+		/* poll the small RX fifo before reading, so the read won't block the bus */
+		while (true) {
+			/* read interrupt status */
+			irq_status = readl(cqspi->iobase + CQSPI_REG_IRQSTATUS);
+			if (irq_status & CQSPI_REG_IRQ_SMALL_RX_FIFO_NOT_EMPTY) {
+				break;
+			}
+		}
+
 		*((u64 *)rx_buf) = readq(cqspi->ahb_base);
 		rx_buf += 8;
 		rx_len -= 8;
+
+		/* In the event where the RX FIFO still has more than 8 bytes after
+		   reading the available 8 bytes, the controller won't rise the
+		   interrupt status again, even though there are still over 7 (RX THRESHOLD) bytes.
+		   To overcome this, we set the threshold to the maximum value,
+		   then clear the interrupt status, and then set it back to the original value.
+		   */
+		writel(CQSPI_RX_THRESHOLD_MAX, cqspi->iobase + CQSPI_REG_RX_THRESHOLD);
+
+		/* clear small fifo not empty interrupt */
+		writel(CQSPI_REG_IRQ_SMALL_RX_FIFO_NOT_EMPTY, cqspi->iobase + CQSPI_REG_IRQSTATUS);
+
+		/* set the threshold back to the original value */
+		writel(CQSPI_RX_THRESHOLD_VALUE, cqspi->iobase + CQSPI_REG_RX_THRESHOLD);
 	}
 	if (rx_len >= 4) {
 		*((u32 *)rx_buf) = readl(cqspi->ahb_base);
@@ -1395,12 +1496,12 @@ static const u8 *cqspi_spi_write_small_tx_fifo(struct cqspi_st *cqspi, const u8 
 	cqspi->remaining_message_rx_bytes += tx_len;
 
 	if (tx_len == 32) {
-		vst4_u8((u8 *)cqspi->ahb_base, vld4_u8(tx_buf));
+		neon_write_32B(tx_buf, cqspi->ahb_base);
 		tx_buf += 32;
 		tx_len -= 32;
 	}
 	if (tx_len >= 16) {
-		vst2_u8((u8 *)cqspi->ahb_base, vld2_u8(tx_buf));
+		neon_write_16B(tx_buf, cqspi->ahb_base);
 		tx_buf += 16;
 		tx_len -= 16;
 	}
@@ -1519,13 +1620,44 @@ static int cqspi_transfer_one_message(struct spi_master *master,
 		offset += xfer->len;
 	}
 
-	/* send all tx buffer - this should be atomic action since we don't want the spi clock to be closed */
+	/* we want to handle SMALL_RX_FIFO_NOT_EMPTY interrupts by polling the interrupt status register.
+	   The controller does not raise the status of interrupt status unless it is unmaksed,
+	   but unmaksing it causes the interrupt handler to get called.
+	   Because we want to enable the interrupt but want to handle the interrupt by polling,
+	   we disable the device's irq so that the interrupt handler is not called.  */
+	disable_irq(cqspi->irq);
+
+	/* enable rx fifo not empty interrupt */
+	writel(CQSPI_REG_IRQ_SMALL_RX_FIFO_NOT_EMPTY, cqspi->iobase + CQSPI_REG_IRQMASK);
+
+	/* clear all interrupts */
+	writel(CQSPI_IRQ_STATUS_MASK, cqspi->iobase + CQSPI_REG_IRQSTATUS);
+
+	/* we use NEON operations when filling the TX fifo. We must wrap the NEON operations with
+	   kernel_neon_begin/end() to work with NEON. kernel_neon_begin() has to be called before local_irq_disable()
+	   because kernel_neon_begin() must run when may_use_simd() is true, and may_use_simd() checks
+	   irqs_disabled() is false. */
+	kernel_neon_begin();
+	/* If the TX fifo empties, the controller closes the clock and chip-select,
+	   and treats new bytes in the TX fifo as a new message.
+	   We disable interrupts because we want to prevent interrupting the code that fills
+	   the TX fifo to prevent the TX fifo of ever being emptied in the middle of a message. */
 	local_irq_disable();
 	rx_buf = cqspi_spi_fill_small_tx_fifo(cqspi, tx_buf, rx_buf, offset);
 	local_irq_enable();
+	kernel_neon_end();
 
 	/* read the rest of rx buffer */
 	cqspi_spi_read_small_rx_fifo(cqspi, rx_buf, cqspi->remaining_message_rx_bytes);
+
+	/* clear interrupt mask */
+	writel(0, cqspi->iobase + CQSPI_REG_IRQMASK);
+
+	/* clear all interrupts */
+	writel(CQSPI_IRQ_STATUS_MASK, cqspi->iobase + CQSPI_REG_IRQSTATUS);
+
+	/* eanble the device's irq back */
+	enable_irq(cqspi->irq);
 
 	rx_buf = cqspi->rx_buf;
 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
@@ -1550,26 +1682,13 @@ exit:
 	return ret;
 }
 
-int cqspi_prepare_transfer_hardware(struct spi_master *master)
-{
-	struct cqspi_st *cqspi = spi_master_get_devdata(master);
-	unsigned int reg;
-
-	reg = readl(cqspi->iobase + CQSPI_REG_CONFIG);
-	if (!(reg & CQSPI_REG_CONFIG_LEGACY_MODE)) {
-		/* move to legacy mode */
-		reg |= CQSPI_REG_CONFIG_LEGACY_MODE;
-		writel(reg, cqspi->iobase + CQSPI_REG_CONFIG);
-	}
-
-	return 0;
-}
-
 int cqspi_prepare_message(struct spi_master *master, struct spi_message *message)
 {
 	struct cqspi_st *cqspi = spi_master_get_devdata(master);
 	struct cqspi_flash_pdata *f_pdata;
 
+	cqspi_clock_mode_setup(cqspi, message->spi->mode);
+	cqspi_legacy_mode_ctrl(cqspi, true);
 	f_pdata = &cqspi->f_pdata[message->spi->chip_select];
 	cqspi_configure(f_pdata, message->spi->max_speed_hz);
 
@@ -1610,6 +1729,8 @@ static void cqspi_controller_init(struct cqspi_st *cqspi)
 		reg &= ~CQSPI_REG_CONFIG_ENB_DIR_ACC_CTRL;
 		writel(reg, cqspi->iobase + CQSPI_REG_CONFIG);
 	}
+
+	writel(CQSPI_RX_THRESHOLD_VALUE, cqspi->iobase + CQSPI_REG_RX_THRESHOLD);
 
 	cqspi_controller_enable(cqspi, 1);
 }
@@ -1687,6 +1808,43 @@ static int cqspi_setup_flash(struct cqspi_st *cqspi)
 	return 0;
 }
 
+static int check_dev_spi_mode(struct device *dev, void *data)
+{
+	struct spi_device *spi = to_spi_device(dev);
+	const struct cqspi_driver_platdata *platdata = data;
+	u32 spi_mode = 0;
+	u32 hwcaps_mask = platdata->hwcaps_mask;
+	int status = 0;
+
+	if (spi->mode & SPI_CPHA)
+		spi_mode |= SPI_CPHA;
+	if (spi->mode & SPI_CPOL)
+		spi_mode |= SPI_CPOL;
+
+	if(!of_property_read_bool(dev->of_node, "hailo,non-flash-device")) {
+		hwcaps_mask &= ~(CQSPI_SUPPORTS_SPI_MODE_1 | CQSPI_SUPPORTS_SPI_MODE_2);
+	}
+
+	if (spi_mode == SPI_MODE_0 && !(hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_0)) {
+		dev_err(dev, "Unsupported SPI mode #0 for device %s\n", dev_name(dev));
+		status = -EINVAL;
+	}
+	if (spi_mode == SPI_MODE_1 && !(hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_1)) {
+		dev_err(dev, "Unsupported SPI mode #1 for device %s\n", dev_name(dev));
+		status = -EINVAL;
+	}
+	if (spi_mode == SPI_MODE_2 && !(hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_2)) {
+		dev_err(dev, "Unsupported SPI mode #2 for device %s\n", dev_name(dev));
+		status = -EINVAL;
+	}
+	if (spi_mode == SPI_MODE_3 && !(hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_3)) {
+		dev_err(dev, "Unsupported SPI mode #3 for device %s\n", dev_name(dev));
+		status = -EINVAL;
+	}
+
+	return status;
+}
+
 static int cqspi_probe(struct platform_device *pdev)
 {
 	const struct cqspi_driver_platdata *ddata;
@@ -1707,7 +1865,6 @@ static int cqspi_probe(struct platform_device *pdev)
 	master->mode_bits = SPI_RX_QUAD | SPI_RX_DUAL | SPI_LSB_FIRST;
 	master->mem_ops = &cqspi_mem_ops;
 	master->dev.of_node = pdev->dev.of_node;
-	master->prepare_transfer_hardware = cqspi_prepare_transfer_hardware;
 	master->prepare_message = cqspi_prepare_message;
 	master->transfer_one_message = cqspi_transfer_one_message;
 
@@ -1820,6 +1977,14 @@ static int cqspi_probe(struct platform_device *pdev)
 			cqspi->use_direct_mode = true;
 		if (ddata->quirks & CQSPI_DISABLE_DMA)
 			cqspi->disable_dma = true;
+		if (ddata->hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_0)
+			master->mode_bits |= SPI_MODE_0;
+		if (ddata->hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_1)
+			master->mode_bits |= SPI_MODE_1;
+		if (ddata->hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_2)
+			master->mode_bits |= SPI_MODE_2;
+		if (ddata->hwcaps_mask & CQSPI_SUPPORTS_SPI_MODE_3)
+			master->mode_bits |= SPI_MODE_3;
 	}
 
 	ret = devm_request_irq(dev, irq, cqspi_irq_handler, 0,
@@ -1828,6 +1993,7 @@ static int cqspi_probe(struct platform_device *pdev)
 		dev_err(dev, "Cannot request IRQ.\n");
 		goto probe_reset_failed;
 	}
+	cqspi->irq = irq;
 
 	cqspi_wait_idle(cqspi);
 	cqspi_controller_init(cqspi);
@@ -1851,6 +2017,11 @@ static int cqspi_probe(struct platform_device *pdev)
 	ret = devm_spi_register_master(dev, master);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to register SPI ctlr %d\n", ret);
+		goto probe_setup_failed;
+	}
+
+	ret = bus_for_each_dev(&spi_bus_type, NULL, (void*)ddata, check_dev_spi_mode);
+	if (ret) {
 		goto probe_setup_failed;
 	}
 
@@ -1912,23 +2083,27 @@ static const struct dev_pm_ops cqspi__dev_pm_ops = {
 #endif
 
 static const struct cqspi_driver_platdata cdns_qspi = {
+	.hwcaps_mask = CQSPI_SUPPORTS_SPI_MODE_ALL,
 	.quirks = CQSPI_DISABLE_DAC_MODE,
 };
 
 static const struct cqspi_driver_platdata k2g_qspi = {
+	.hwcaps_mask = CQSPI_SUPPORTS_SPI_MODE_ALL,
 	.quirks = CQSPI_NEEDS_WR_DELAY,
 };
 
 static const struct cqspi_driver_platdata am654_ospi = {
-	.hwcaps_mask = CQSPI_SUPPORTS_OCTAL,
+	.hwcaps_mask = (CQSPI_SUPPORTS_OCTAL | CQSPI_SUPPORTS_SPI_MODE_ALL),
 	.quirks = CQSPI_NEEDS_WR_DELAY,
 };
 
 static const struct cqspi_driver_platdata intel_lgm_qspi = {
+	.hwcaps_mask = CQSPI_SUPPORTS_SPI_MODE_ALL,
 	.quirks = CQSPI_DISABLE_DAC_MODE,
 };
 
 static const struct cqspi_driver_platdata hailo_qspi = {
+	.hwcaps_mask = (CQSPI_SUPPORTS_SPI_MODE_ALL),
 	/* TODO: we should either move to indirect mode (MSW-2297), or enable DMA (MSW-2298) */
 	.quirks = CQSPI_DISABLE_DMA
 };

@@ -372,6 +372,7 @@ struct vvcam_fe_dev {
 	void (*fe_isp_irq_work) (struct vvcam_fe_dev *dev);
 	int (*fe_read_reg)(struct vvcam_fe_dev *dev, uint8_t vdid, uint32_t offset, uint32_t *val);
 	int (*fe_write_reg)(struct vvcam_fe_dev *dev, uint8_t vdid, uint32_t offset, uint32_t val);
+	int (*fe_switch)(struct vvcam_fe_dev *dev, struct isp_fe_switch_t *fe_switch);
 };
 
 #endif //_FE_DEV_H_   

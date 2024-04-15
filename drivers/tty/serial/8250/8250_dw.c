@@ -33,6 +33,7 @@
 
 /* Offsets for the DesignWare specific registers */
 #define DW_UART_USR	0x1f /* UART Status Register */
+#define DW_UART_SRBR 0xC /* UART Shadow Receive Buffer Register #0 */
 
 /* DesignWare specific register fields */
 #define DW_UART_MCR_SIRE		BIT(6)
@@ -235,7 +236,6 @@ static unsigned int dw8250_serial_in32be(struct uart_port *p, int offset)
        return dw8250_modify_msr(p, offset, value);
 }
 
-
 static int dw8250_handle_irq(struct uart_port *p)
 {
 	struct uart_8250_port *up = up_to_u8250p(p);
@@ -259,8 +259,7 @@ static int dw8250_handle_irq(struct uart_port *p)
 		status = p->serial_in(p, UART_LSR);
 
 		if (!(status & (UART_LSR_DR | UART_LSR_BI)))
-			if (serial8250_can_read_empty_fifo(up))
-				(void) p->serial_in(p, UART_RX);
+			(void) p->serial_in(p, DW_UART_SRBR);
 
 		spin_unlock_irqrestore(&p->lock, flags);
 	}

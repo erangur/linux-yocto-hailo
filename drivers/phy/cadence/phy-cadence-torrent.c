@@ -2214,15 +2214,19 @@ static int cdns_torrent_reset(struct cdns_torrent_phy *cdns_phy)
 
 	cdns_phy->phy_rst = devm_reset_control_get_exclusive_by_index(dev, 0);
 	if (IS_ERR(cdns_phy->phy_rst)) {
-		dev_err(dev, "%s: failed to get reset\n",
-			dev->of_node->full_name);
+		if (PTR_ERR(cdns_phy->phy_rst) != -EPROBE_DEFER) {
+			dev_err(dev, "%s: failed to get reset\n",
+					dev->of_node->full_name);
+		}
 		return PTR_ERR(cdns_phy->phy_rst);
 	}
 
 	cdns_phy->apb_rst = devm_reset_control_get_optional_exclusive(dev, "torrent_apb");
 	if (IS_ERR(cdns_phy->apb_rst)) {
-		dev_err(dev, "%s: failed to get apb reset\n",
-			dev->of_node->full_name);
+		if (PTR_ERR(cdns_phy->apb_rst) != -EPROBE_DEFER) {
+			dev_err(dev, "%s: failed to get apb reset\n",
+					dev->of_node->full_name);
+		}
 		return PTR_ERR(cdns_phy->apb_rst);
 	}
 

@@ -8,6 +8,7 @@
 
 static const struct of_device_id hailo_soc_of_match[] = {
 	{ .compatible = "hailo,hailo15" },
+	{ .compatible = "hailo,hailo15l" },
 	{}
 };
 

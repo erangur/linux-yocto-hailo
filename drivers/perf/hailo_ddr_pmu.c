@@ -101,8 +101,6 @@ struct hailo_pmu {
 	struct platform_device *pdev;
 	struct perf_output_handle handle;
 	struct ddr_sample *scu_buf;
-	void *tmp_buf;
-	size_t tmp_buf_size;
 	void *aux_buf;
 	size_t aux_buf_remaining_size;
 	size_t remaining_samples;
@@ -882,8 +880,7 @@ static int hailo_pmu_ended_notifier(struct notifier_block *nb, unsigned long eve
 	samples_size = number_of_samples * sizeof(struct ddr_sample);
 
 	/* Copy the samples to the aux buffer and update current state */
-	memcpy(hailo_pmu->tmp_buf, &hailo_pmu->scu_buf[report->sample_start_index], hailo_pmu->tmp_buf_size);
-	memcpy(hailo_pmu->aux_buf, hailo_pmu->tmp_buf, samples_size);
+	memcpy_fromio(hailo_pmu->aux_buf, &hailo_pmu->scu_buf[report->sample_start_index], samples_size);
 
 	hailo_pmu->remaining_samples -= number_of_samples;
 	hailo_pmu->total_bytes_written += samples_size;
@@ -932,7 +929,6 @@ static int hailo_pmu_probe(struct platform_device *pdev)
 	int ret;
 	struct hailo_pmu *hailo_pmu = NULL;
 	struct task_struct *thread;
-	struct resource *res;
 
 	/* Create driver */
 	hailo_pmu = devm_kzalloc(&pdev->dev, sizeof(*hailo_pmu), GFP_KERNEL);
@@ -967,15 +963,7 @@ static int hailo_pmu_probe(struct platform_device *pdev)
 	}
 
 	/* Remap SCU shared buffer */
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ddr_pmu_samples");
-	if (!res) {
-		pr_err("Failed to get SCU buffer resource\n");
-		return -ENODEV;
-	}
-
-	hailo_pmu->scu_buf = devm_memremap(&pdev->dev, res->start, resource_size(res), MEMREMAP_WT);
-	hailo_pmu->tmp_buf = devm_kmalloc(&pdev->dev, resource_size(res), GFP_KERNEL);
-	hailo_pmu->tmp_buf_size = resource_size(res);
+	hailo_pmu->scu_buf = devm_platform_ioremap_resource_byname(pdev, "ddr_pmu_samples");
 	if (IS_ERR(hailo_pmu->scu_buf)) {
 		pr_err("Failed to remap SCU buffer: %ld\n", PTR_ERR(hailo_pmu->scu_buf));
 		return PTR_ERR(hailo_pmu->scu_buf);

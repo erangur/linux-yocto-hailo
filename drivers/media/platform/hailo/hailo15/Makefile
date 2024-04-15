@@ -22,12 +22,15 @@ ISP_CTRL_OBJS += isp_ctrl/af/afv1/hailo15_isp_afv1.o
 ISP_CTRL_OBJS += isp_ctrl/hdr/hailo15_isp_hdr.o
 
 hailo15-af-monitor-objs += hailo15-af-monitor-example.o
-hailo15-isp-objs += hailo15-isp-hw.o hailo15-isp-v4l.o hailo15-events.o $(ISP_CTRL_OBJS)
-hailo15-video-cap-objs += hailo15-vid-cap.o hailo15-events.o
+hailo15-isp-objs += hailo15-isp-hw.o hailo15-isp-v4l.o hailo15-isp-events.o $(ISP_CTRL_OBJS)
+hailo15-video-cap-objs += hailo15-vid-cap.o hailo15-video-events.o
 obj-y         += common.o
+obj-y         += hailo15-media.o
 obj-m         += hailo15-video-cap.o
 obj-$(CONFIG_VIDEO_HAILO15_PIX_MUX)    += hailo15-pixel-mux.o
 obj-$(CONFIG_VIDEO_HAILO15_RXWRAPPER)     += hailo15-rxwrapper.o
 obj-$(CONFIG_VIDEO_HAILO15_ISP)            += hailo15-isp.o
 obj-$(CONFIG_VIDEO_HAILO15_AF_MONITOR_EXAMPLE)     += hailo15-af-monitor.o
+hailo15-video-out-objs += hailo15-vid-out.o
+obj-m += hailo15-video-out.o
 obj-y += fe/

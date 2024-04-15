@@ -1040,17 +1040,14 @@ static void isp_fe_buffer_append_isp_update(struct vvcam_fe_dev *dev)
 	fe->fe_buff[vdid].refresh_part_regs.curr_cmd_num++;
 }
 
-static int isp_fe_switch(struct vvcam_fe_dev *dev, void __user *args)
+static int __isp_fe_switch(struct vvcam_fe_dev *dev, struct isp_fe_switch_t *fe_switch)
 {
 	int ret = 0;
 	uint8_t vdid;
 	uint32_t part_cmd_num;
 	unsigned long flags, full_buff_flags;
-	struct isp_fe_switch_t fe_switch;
 	struct isp_fe_context *fe = &dev->fe;
 	isp_info("enter %s\n", __func__);
-
-	viv_check_retval(copy_from_user(&fe_switch, args, sizeof(struct isp_fe_switch_t)));
 
 	//wait fe dma
 	if (fe->state == ISP_FE_STATE_RUNNING) {
@@ -1063,12 +1060,12 @@ static int isp_fe_switch(struct vvcam_fe_dev *dev, void __user *args)
 
 	reinit_completion(&fe->fe_completion);
 	reinit_completion(&fe->isp_completion);
-	isp_fe_update_sensor_id(dev, &fe_switch);
+	isp_fe_update_sensor_id(dev, fe_switch);
 
 	vdid = fe->curr_vdid;
-	isp_info("%s vdid value = %d, next id value = %d\n", __func__, vdid, fe_switch.next_vdid[0]);
+	isp_info("%s vdid value = %d, next id value = %d\n", __func__, vdid, fe_switch->next_vdid[0]);
 
-	if (vdid == fe_switch.next_vdid[0]) {
+	if (vdid == fe_switch->next_vdid[0]) {
 		if (fe->fe_buff[vdid].refresh_part_regs.curr_cmd_num == 0) {	//no register to be updated
 			return 0;
 		}
@@ -1119,8 +1116,8 @@ static int isp_fe_switch(struct vvcam_fe_dev *dev, void __user *args)
 			spin_unlock_irqrestore(&fe->full_buff_lock, full_buff_flags);
 		}
 	} else {		//fe->curr_vdid != fe_switch->next_vdid[0]
-		fe->curr_vdid = fe_switch.next_vdid[0];
-		vdid = fe_switch.next_vdid[0];
+		fe->curr_vdid = fe_switch->next_vdid[0];
+		vdid = fe_switch->next_vdid[0];
 #if VIV_ISP_FE_DEBUG_DUMP == 1
 		isp_fe_cmdbuffer_dump(&fe->fe_buff[vdid].refresh_full_regs);
 #endif
@@ -1140,6 +1137,17 @@ static int isp_fe_switch(struct vvcam_fe_dev *dev, void __user *args)
 	}
 
 	return ret;
+}
+
+static int isp_fe_switch(struct vvcam_fe_dev *dev, void __user *args){
+	struct isp_fe_switch_t fe_switch;
+	
+	memset(&fe_switch, 0, sizeof(fe_switch));
+	isp_info("enter %s\n", __func__);
+
+	viv_check_retval(copy_from_user(&fe_switch, args, sizeof(struct isp_fe_switch_t)));
+
+	return __isp_fe_switch(dev, &fe_switch);
 }
 
 int isp_fe_set_params(struct vvcam_fe_dev *dev, void __user *args)
@@ -1778,6 +1786,7 @@ static int vvcam_fe_probe(struct platform_device *pdev)
 	pfe_dev->fe_isp_irq_work = isp_fe_isp_irq_work;
 	pfe_dev->fe_read_reg = isp_fe_read_reg;
 	pfe_dev->fe_write_reg = isp_fe_write_reg;
+	pfe_dev->fe_switch = __isp_fe_switch;
 	fe_register_index++;
 	fe_dev = pfe_dev;
 	pr_info("exit %s\n", __func__);

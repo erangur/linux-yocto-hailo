@@ -6,6 +6,8 @@
  *
  */
 
+#include <linux/irq.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/gpio/driver.h>
 #include <linux/platform_device.h>
@@ -14,49 +16,138 @@
 
 #define CMSDK_GPIO_MAX_NGPIO (16)
 typedef struct GPIO_BLOCK_regs_s {
-	volatile uint32_t DATA; /* offset: 0x0 ; repeat: [1]        */
-	volatile uint32_t DATAOUT; /* offset: 0x4 ; repeat: [1]        */
-	volatile uint32_t reserved_0[2]; /* offset: 0x8 ; repeat: [2]        */
-	volatile uint32_t OUTENSET; /* offset: 0x10 ; repeat: [1]        */
-	volatile uint32_t OUTENCLR; /* offset: 0x14 ; repeat: [1]        */
-	volatile uint32_t ALTFUNCSET; /* offset: 0x18 ; repeat: [1]        */
-	volatile uint32_t ALTFUNCCLR; /* offset: 0x1c ; repeat: [1]        */
-	volatile uint32_t INTENSET; /* offset: 0x20 ; repeat: [1]        */
-	volatile uint32_t INTENCLR; /* offset: 0x24 ; repeat: [1]        */
-	volatile uint32_t INTTYPESET; /* offset: 0x28 ; repeat: [1]        */
-	volatile uint32_t INTTYPECLR; /* offset: 0x2c ; repeat: [1]        */
-	volatile uint32_t INTPOLSET; /* offset: 0x30 ; repeat: [1]        */
-	volatile uint32_t INTPOLCLR; /* offset: 0x34 ; repeat: [1]        */
-	volatile uint32_t INTSTATUS; /* offset: 0x38 ; repeat: [1]        */
-	volatile uint32_t reserved_1[241]; /* offset: 0x3c ; repeat: [241]      */
-	volatile uint32_t MASKLOWBYTE; /* offset: 0x400 ; repeat: [1]        */
+	volatile uint32_t DATA;
+	volatile uint32_t DATAOUT;
+	volatile uint32_t reserved_0[2];
+	volatile uint32_t OUTENSET;
+	volatile uint32_t OUTENCLR;
+	volatile uint32_t ALTFUNCSET;
+	volatile uint32_t ALTFUNCCLR;
+	volatile uint32_t INTENSET;
+	volatile uint32_t INTENCLR;
+	volatile uint32_t INTTYPESET;
+	volatile uint32_t INTTYPECLR;
+	volatile uint32_t INTPOLSET;
+	volatile uint32_t INTPOLCLR;
+	union {
+		volatile uint32_t INTSTATUS;
+		volatile uint32_t INTCLEAR;
+	};
+	volatile uint32_t reserved_1[241];
+	volatile uint32_t MASKLOWBYTE;
 	volatile uint32_t
-		reserved_2[255]; /* offset: 0x404 ; repeat: [255]      */
-	volatile uint32_t MASKHIGHBYTE; /* offset: 0x800 ; repeat: [1]        */
+		reserved_2[255];
+	volatile uint32_t MASKHIGHBYTE;
 	volatile uint32_t
-		reserved_3[499]; /* offset: 0x804 ; repeat: [499]      */
-	volatile uint32_t PID4; /* offset: 0xfd0 ; repeat: [1]        */
-	volatile uint32_t PID5; /* offset: 0xfd4 ; repeat: [1]        */
-	volatile uint32_t PID6; /* offset: 0xfd8 ; repeat: [1]        */
-	volatile uint32_t PID7; /* offset: 0xfdc ; repeat: [1]        */
-	volatile uint32_t PID0; /* offset: 0xfe0 ; repeat: [1]        */
-	volatile uint32_t PID1; /* offset: 0xfe4 ; repeat: [1]        */
-	volatile uint32_t PID2; /* offset: 0xfe8 ; repeat: [1]        */
-	volatile uint32_t PID3; /* offset: 0xfec ; repeat: [1]        */
-	volatile uint32_t CID0; /* offset: 0xff0 ; repeat: [1]        */
-	volatile uint32_t CID1; /* offset: 0xff4 ; repeat: [1]        */
-	volatile uint32_t CID2; /* offset: 0xff8 ; repeat: [1]        */
-	volatile uint32_t CID3; /* offset: 0xffc ; repeat: [1]        */
+		reserved_3[499];
+	volatile uint32_t PID4;
+	volatile uint32_t PID5;
+	volatile uint32_t PID6;
+	volatile uint32_t PID7;
+	volatile uint32_t PID0;
+	volatile uint32_t PID1;
+	volatile uint32_t PID2;
+	volatile uint32_t PID3;
+	volatile uint32_t CID0;
+	volatile uint32_t CID1;
+	volatile uint32_t CID2;
+	volatile uint32_t CID3;
 } GPIO_BLOCK_regs_s;
+
+typedef struct GPIO_MANAGER_CONFIG_regs_s  {
+	volatile uint32_t gpio_int_mask;
+	volatile uint32_t gpio_int_status;
+	volatile uint32_t gpio_int_w1c;
+} GPIO_MANAGER_CONFIG_t;
 
 struct cmsdk_gpio {
 	raw_spinlock_t lock;
 	void __iomem *base;
+
+	/* Our GPIO instances share the same config registers.
+	   Please access these registers with caution. */
+	void __iomem *config;
+
 	struct gpio_chip gc;
 	struct irq_chip irq_chip;
-	int parent_irq;
 	unsigned int gpio_index_module_offset;
+
+	struct irq_domain *irq_domain;
 };
+
+static void cmsdk_irq_ack(struct irq_data *data) {
+}
+
+static void cmsdk_irq_mask(struct irq_data *data) {
+	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(data);
+	struct cmsdk_gpio *gpio = gc->private;
+	GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS =
+		((GPIO_BLOCK_regs_s *)gpio->base);
+	int pin = data->hwirq;
+	uint32_t mask = BIT(pin);
+
+	CMSDK_GPIO_REGS->INTENCLR |= mask;
+}
+
+static void cmsdk_irq_unmask(struct irq_data *data) {
+	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(data);
+	struct cmsdk_gpio *gpio = gc->private;
+	GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS =
+		((GPIO_BLOCK_regs_s *)gpio->base);
+	int pin = data->hwirq;
+	uint32_t mask = BIT(pin);
+
+	CMSDK_GPIO_REGS->INTENSET |= mask;
+}
+
+static inline void cmsdk_reverse_polarity(GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS, int pin) {
+	uint32_t mask = BIT(pin);
+	uint32_t polarity = readl(&CMSDK_GPIO_REGS->INTPOLSET);
+
+	if (mask & polarity)
+		writew(mask, &CMSDK_GPIO_REGS->INTPOLCLR);
+	else
+		writew(mask, &CMSDK_GPIO_REGS->INTPOLSET);
+}
+
+static int cmsdk_irq_set_type(struct irq_data *data, unsigned int type) {
+	struct irq_chip_generic *icg = irq_data_get_irq_chip_data(data);
+	struct irq_chip_type *ct = irq_data_get_chip_type(data);
+	struct cmsdk_gpio *gpio = icg->private;
+	GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS =
+		((GPIO_BLOCK_regs_s *)gpio->base);
+	int pin = irqd_to_hwirq(data);
+	uint32_t mask = BIT(pin);
+
+	type &= IRQ_TYPE_SENSE_MASK;
+
+	if (type != IRQ_TYPE_EDGE_RISING
+	    && type != IRQ_TYPE_EDGE_FALLING
+	    && type != IRQ_TYPE_LEVEL_HIGH
+	    && type != IRQ_TYPE_LEVEL_LOW
+	    && type != IRQ_TYPE_EDGE_BOTH)
+		return -EINVAL;
+
+	if (!(ct->type & type))
+		if (irq_setup_alt_chip(data, type))
+			return -EINVAL;
+
+	/* Set INTTYPE */
+	if (type == IRQ_TYPE_EDGE_RISING || type == IRQ_TYPE_EDGE_FALLING || type == IRQ_TYPE_EDGE_BOTH)
+		writew(mask, &CMSDK_GPIO_REGS->INTTYPESET);
+	else
+		writew(mask, &CMSDK_GPIO_REGS->INTTYPECLR);
+
+	/* Set INTPOL */
+	if (type == IRQ_TYPE_EDGE_BOTH)
+		cmsdk_reverse_polarity(CMSDK_GPIO_REGS, pin);
+	else if (type == IRQ_TYPE_LEVEL_HIGH || type == IRQ_TYPE_EDGE_RISING)
+		writew(mask, &CMSDK_GPIO_REGS->INTPOLSET);
+	else
+		writew(mask, &CMSDK_GPIO_REGS->INTPOLCLR);
+
+	return 0;
+}
 
 static int cmsdk_gpio_get_value(struct gpio_chip *gc, unsigned int offset)
 {
@@ -197,6 +288,167 @@ static int cmsdk_gpio_direction_output(struct gpio_chip *gc,
 	return 0;
 }
 
+static int cmsdk_irq_request_resources(struct irq_data *data)
+{
+	struct irq_chip_generic *icg = irq_data_get_irq_chip_data(data);
+	struct cmsdk_gpio *cmsdk_gpio = icg->private;
+	int ret;
+
+	ret = cmsdk_gpio->gc.request(&cmsdk_gpio->gc, irqd_to_hwirq(data));
+	if (ret) {
+		dev_err(cmsdk_gpio->gc.parent,
+			"failed to request pin %lu, ret = %d\n",
+			irqd_to_hwirq(data), ret);
+		return ret;
+	}
+
+	ret = cmsdk_gpio->gc.direction_input(&cmsdk_gpio->gc, irqd_to_hwirq(data));
+	if (ret) {
+		dev_err(cmsdk_gpio->gc.parent,
+			"failed to set pin %lu to input direction, ret = %d\n",
+			irqd_to_hwirq(data), ret);
+		return ret;
+	}
+
+	return gpiochip_reqres_irq(&cmsdk_gpio->gc, irqd_to_hwirq(data));
+}
+
+static void cmsdk_irq_release_resources(struct irq_data *data)
+{
+	struct irq_chip_generic *icg = irq_data_get_irq_chip_data(data);
+	struct cmsdk_gpio *cmsdk_gpio = icg->private;
+
+	gpiochip_relres_irq(&cmsdk_gpio->gc, irqd_to_hwirq(data));
+}
+
+static int cmsdk_gpio_to_irq(struct gpio_chip *gc, unsigned int pin)
+{
+	struct cmsdk_gpio *cmsdk_gpio = gpiochip_get_data(gc);
+	return irq_create_mapping(cmsdk_gpio->irq_domain, pin);
+}
+
+static irqreturn_t cmsdk_irq_handler(int irq __maybe_unused, void *dev_id)
+{
+	struct cmsdk_gpio *gpio = dev_id;
+	GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS;
+	GPIO_MANAGER_CONFIG_t *GPIO_MANAGER_CONFIG_REGS;
+	unsigned long status;
+	int i;
+	int ret;
+
+	if (gpio == NULL)
+		return IRQ_NONE;
+
+	CMSDK_GPIO_REGS = ((GPIO_BLOCK_regs_s *)gpio->base);
+	GPIO_MANAGER_CONFIG_REGS = ((GPIO_MANAGER_CONFIG_t *)gpio->config);
+
+	status = readw(&CMSDK_GPIO_REGS->INTSTATUS);
+	if (!status)
+		return IRQ_NONE;
+
+	writew(status, &CMSDK_GPIO_REGS->INTCLEAR);
+	writel(status << gpio->gpio_index_module_offset, &GPIO_MANAGER_CONFIG_REGS->gpio_int_w1c);
+
+	for_each_set_bit(i, &status, gpio->gc.ngpio) {
+		unsigned int irq;
+		uint32_t type;
+
+		irq = irq_find_mapping(gpio->irq_domain, i);
+		type = irq_get_trigger_type(irq);
+
+		if (type == IRQ_TYPE_EDGE_BOTH)
+			cmsdk_reverse_polarity(CMSDK_GPIO_REGS, i);
+
+		ret = generic_handle_irq(irq);
+	}
+
+	return IRQ_HANDLED;
+}
+
+static void disable_gpio_irqs(struct cmsdk_gpio *cmsdk_gpio)
+{
+	GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS =
+		((GPIO_BLOCK_regs_s *)cmsdk_gpio->base);
+	GPIO_MANAGER_CONFIG_t *GPIO_MANAGER_CONFIG_REGS =
+		((GPIO_MANAGER_CONFIG_t *)cmsdk_gpio->config);
+
+	writew(0xFFFF, &CMSDK_GPIO_REGS->INTCLEAR);
+	writel(0xFFFF << cmsdk_gpio->gpio_index_module_offset, &GPIO_MANAGER_CONFIG_REGS->gpio_int_w1c);
+	writew(0xFFFF, &CMSDK_GPIO_REGS->INTENCLR);
+}
+
+static void enable_gpio_irqs(struct cmsdk_gpio *cmsdk_gpio)
+{
+	GPIO_BLOCK_regs_s *CMSDK_GPIO_REGS =
+		((GPIO_BLOCK_regs_s *)cmsdk_gpio->base);
+	GPIO_MANAGER_CONFIG_t *GPIO_MANAGER_CONFIG_REGS =
+		((GPIO_MANAGER_CONFIG_t *)cmsdk_gpio->config);
+
+	writew(0xFFFF, &CMSDK_GPIO_REGS->INTCLEAR);
+	/* Enable interrupts of both GPIOs */
+	writel(0xFFFFFFFF, &GPIO_MANAGER_CONFIG_REGS->gpio_int_mask);
+}
+
+static int cmsdk_setup_irq(struct platform_device *pdev, struct cmsdk_gpio *cmsdk_gpio)
+{
+	struct irq_chip_generic *gc;
+	struct irq_chip_type *ct;
+	int irq, ret;
+
+	irq = platform_get_irq(pdev, 0);
+	if (!irq) {
+		dev_err(&pdev->dev, "Failed to get IRQ resource\n");
+		return -EINVAL;
+	}
+
+	cmsdk_gpio->irq_domain = irq_domain_add_linear(pdev->dev.of_node,
+						       cmsdk_gpio->gc.ngpio,
+						       &irq_generic_chip_ops,
+						       &cmsdk_gpio->gc);
+	if (!cmsdk_gpio->irq_domain) {
+		dev_err(&pdev->dev, "Failed to create IRQ domain\n");
+		return -ENOMEM;
+	}
+
+	ret = irq_alloc_domain_generic_chips(
+		cmsdk_gpio->irq_domain,
+		cmsdk_gpio->gc.ngpio, 1, dev_name(&pdev->dev),
+		handle_level_irq, 0, 0, 0);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to allocate IRQ chips\n");
+		irq_domain_remove(cmsdk_gpio->irq_domain);
+		return ret;
+	}
+
+	gc = irq_get_domain_generic_chip(cmsdk_gpio->irq_domain, 0);
+	gc->private = cmsdk_gpio;
+	ct = &gc->chip_types[0];
+	ct->type = IRQCHIP_SET_TYPE_MASKED | IRQCHIP_MASK_ON_SUSPEND;
+	ct->chip.irq_ack = cmsdk_irq_ack;
+	ct->chip.irq_mask = cmsdk_irq_mask;
+	ct->chip.irq_unmask = cmsdk_irq_unmask;
+	ct->chip.irq_set_type = cmsdk_irq_set_type;
+	ct->chip.irq_request_resources = cmsdk_irq_request_resources;
+	ct->chip.irq_release_resources = cmsdk_irq_release_resources;
+	ct->chip.name = cmsdk_gpio->gc.label;
+
+	/* Request shared IRQ (both GPIOs use the same IRQ) */
+	ret = devm_request_irq(&pdev->dev, irq, cmsdk_irq_handler,
+			       IRQF_SHARED, dev_name(&pdev->dev), cmsdk_gpio);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to request IRQ\n");
+		irq_domain_remove(cmsdk_gpio->irq_domain);
+		return -ENOENT;
+	}
+
+	/* Enable interrupts */
+	enable_gpio_irqs(cmsdk_gpio);
+
+	dev_dbg(&pdev->dev, "CMSDK GPIO registered interrupts\n");
+
+	return 0;
+}
+
 static int cmsdk_gpio_probe(struct platform_device *pdev)
 {
 	struct cmsdk_gpio *cmsdk_gpio;
@@ -211,12 +463,32 @@ static int cmsdk_gpio_probe(struct platform_device *pdev)
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
-		dev_err(&pdev->dev, "Error getting resource\n");
+		dev_err(&pdev->dev, "Error getting base resource\n");
 		return -ENODEV;
 	}
 	cmsdk_gpio->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(cmsdk_gpio->base))
 		return PTR_ERR(cmsdk_gpio->base);
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res) {
+		dev_err(&pdev->dev, "Error getting config resource\n");
+		return -ENODEV;
+	}
+
+	/* 
+	 * We map a shared resource between all GPIO instances.
+	 * In order to avoid resource-already-in-use error,
+	 * we use devm_ioremap instead of devm_ioremap_resource.
+	 */
+	cmsdk_gpio->config = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+	if (IS_ERR(cmsdk_gpio->config)) {
+		dev_err(&pdev->dev, "Error mapping config resource\n");
+		return PTR_ERR(cmsdk_gpio->config);
+	}
+	
+	/* Disable interrupts */
+	disable_gpio_irqs(cmsdk_gpio);
 
 	raw_spin_lock_init(&cmsdk_gpio->lock);
 
@@ -233,8 +505,11 @@ static int cmsdk_gpio_probe(struct platform_device *pdev)
 		cmsdk_gpio->gc.ngpio = CMSDK_GPIO_MAX_NGPIO;
 	}
 
-	of_property_read_u32(pdev->dev.of_node, "cmsdk_gpio,gpio-offset",
-			     &cmsdk_gpio->gpio_index_module_offset);
+	if (of_property_read_u32(pdev->dev.of_node, "cmsdk_gpio,gpio-offset",
+				 &cmsdk_gpio->gpio_index_module_offset)) {
+		dev_err(&pdev->dev, "Error getting gpio-offset\n");
+		return -ENODEV;
+	}
 
 	cmsdk_gpio->gc.request = gpiochip_generic_request;
 	cmsdk_gpio->gc.free = gpiochip_generic_free;
@@ -247,10 +522,22 @@ static int cmsdk_gpio_probe(struct platform_device *pdev)
 	cmsdk_gpio->gc.label = dev_name(&pdev->dev);
 	cmsdk_gpio->gc.parent = &pdev->dev;
 	cmsdk_gpio->gc.owner = THIS_MODULE;
+	cmsdk_gpio->gc.to_irq = cmsdk_gpio_to_irq;
 
 	ret = devm_gpiochip_add_data(&pdev->dev, &cmsdk_gpio->gc, cmsdk_gpio);
 	if (ret)
 		return ret;
+
+	ret = platform_irq_count(pdev);
+	if (ret < 0)
+		return ret;
+
+	/* Setup IRQ */
+	if (ret > 0) {
+		ret = cmsdk_setup_irq(pdev, cmsdk_gpio);
+		if (ret)
+			return ret;
+	}
 
 	dev_info(&pdev->dev, "CMSDK GPIO chip registered\n");
 

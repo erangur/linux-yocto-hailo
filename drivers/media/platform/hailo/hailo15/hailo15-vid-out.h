@@ -1,5 +1,5 @@
-#ifndef _HAILO_VIDEO_H_
-#define _HAILO_VIDEO_H_
+#ifndef _HAILO_VIDEO_OUT_H_
+#define _HAILO_VIDEO_OUT_H_
 
 #include <linux/list.h>
 #include <linux/spinlock.h>
@@ -13,20 +13,17 @@
 #include <linux/dma-buf.h>
 #include <media/media-entity.h>
 #include "common.h"
-#include "hailo15-events.h"
 
 #define MAX_NUM_FORMATS (8)
-#define MAX_SUBDEVS_NUM (8)
-#define MAX_VIDEO_NODE_NUM (5)
-#define CONFIG_HAILO_DEVICE_TPG
-#define CONFIG_HAILO_DEVICE_TPG_USE_FILE
+#define MAX_SUBDEVS_NUM (2)
+#define MAX_VIDEO_NODE_NUM (2)
 
 struct dev_node {
 	struct device_node *node;
 	int id;
 };
 
-struct hailo15_video_node {
+struct hailo15_video_out_node {
 	struct device *dev;
 	int id;
 	struct video_device *video_dev;
@@ -41,16 +38,11 @@ struct hailo15_video_node {
 	struct hailo15_video_fmt formats[MAX_NUM_FORMATS];
 	int formatscount;
 
-	struct hailo15_event_resource event_resource;
-
 	spinlock_t qlock;
 	struct list_head buf_queue;
-	bool skip_first_list_entry;
 
 	struct vb2_queue queue;
 	struct mutex buffer_mutex;
-
-	struct hailo15_buffer *prev_buf;
 
 	struct hailo15_buf_ctx buf_ctx;
 	struct mutex ioctl_mutex;
@@ -58,26 +50,16 @@ struct hailo15_video_node {
 	int streaming;
 	int path;
 	int sequence;
-	int pipeline_init;
 };
 
-struct hailo15_vid_cap_device {
+struct hailo15_vid_out_device {
 	struct device *dev;
 	struct media_device mdev;
 	struct v4l2_async_notifier subdev_notifier;
-	struct hailo15_video_node *vid_nodes[MAX_VIDEO_NODE_NUM];
+	struct hailo15_video_out_node *vid_nodes[MAX_VIDEO_NODE_NUM];
+	struct list_head subdevs;
 };
 
-struct hailo15_get_vsm_params {
-	int index;
-	struct hailo15_vsm vsm;
-};
+#define queue_to_node(__q) container_of(__q, struct hailo15_video_out_node, queue)
 
-#define queue_to_node(__q) container_of(__q, struct hailo15_video_node, queue)
-
-int hailo15_video_post_event_create_pipeline(
-	struct hailo15_video_node *vid_node);
-int hailo15_video_post_event_release_pipeline(
-	struct hailo15_video_node *vid_node);
-
-#endif /*_HAILO_VIDEO_H */
+#endif /*_HAILO_VIDEO_OUT_H */

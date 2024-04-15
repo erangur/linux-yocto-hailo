@@ -14,4 +14,6 @@
 
 long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p);
 
+long xrp_ioctl_get_stats(struct file *filp, struct xrp_ioctl_stats __user *p);
+
 #endif

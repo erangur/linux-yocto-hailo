@@ -67,8 +67,7 @@ int hailo15_fill_planes_fmt(const struct hailo15_video_fmt *format,
 	struct v4l2_plane_pix_format *plane_fmt;
 
 	if (WARN_ON(!format->num_planes ||
-		    format->num_planes >= FMT_MAX_PLANES)) {
-		pr_info("hailo15-vid-cap: invalid planarity\n");
+		    format->num_planes > FMT_MAX_PLANES)) {
 		return -EINVAL;
 	}
 
@@ -86,19 +85,33 @@ int hailo15_fill_planes_fmt(const struct hailo15_video_fmt *format,
 }
 EXPORT_SYMBOL(hailo15_fill_planes_fmt);
 
-const struct hailo15_video_fmt *hailo15_fourcc_get_format(uint32_t fourcc)
+const struct hailo15_video_fmt *hailo15_fourcc_get_format(uint32_t fourcc, __u8 num_planes)
 {
 	const struct hailo15_video_fmt *formats = hailo15_get_formats();
 	int format;
 
 	for (format = 0; format < hailo15_get_formats_count(); ++format) {
-		if (formats[format].fourcc == fourcc)
+		if (formats[format].fourcc == fourcc && formats[format].num_planes == num_planes)
 			return &formats[format];
 	}
 
 	return NULL;
 };
 EXPORT_SYMBOL(hailo15_fourcc_get_format);
+
+const struct hailo15_video_fmt *hailo15_fourcc_get_out_format(uint32_t fourcc, __u8 num_planes)
+{
+	const struct hailo15_video_fmt *formats = hailo15_get_out_formats();
+	int format;
+
+	for (format = 0; format < hailo15_get_out_formats_count(); ++format) {
+		if (formats[format].fourcc == fourcc && formats[format].num_planes == num_planes)
+			return &formats[format];
+	}
+
+	return NULL;
+};
+EXPORT_SYMBOL(hailo15_fourcc_get_out_format);
 
 const struct hailo15_video_fmt *hailo15_code_get_format(uint32_t code)
 {

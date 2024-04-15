@@ -85,6 +85,7 @@ static int hailo15_isp_afv1_g_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case HAILO15_ISP_CID_AF_ENABLE:
+	case HAILO15_ISP_CID_AF_AVAILABLE:
 	case HAILO15_ISP_CID_AF_WINDOW:
 	case HAILO15_ISP_CID_AF_MEASUREMENT:
 		ret = hailo15_isp_g_ctrl_event(isp_dev, isp_dev->ctrl_pad,
@@ -109,35 +110,45 @@ const struct v4l2_ctrl_config hailo15_isp_afv1_ctrls[] = {
 		.ops = &hailo15_isp_afv1_ctrl_ops,
 		.id = HAILO15_ISP_CID_AF_ENABLE,
 		.type = V4L2_CTRL_TYPE_BOOLEAN,
-		.flags = V4L2_CTRL_FLAG_VOLATILE |
-			 V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+		.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.name = "isp_af_enable",
 		.step = 1,
 		.min = 0,
 		.max = 1,
 	},
 	{
+        .ops  = &hailo15_isp_afv1_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AF_AVAILABLE,
+        .type = V4L2_CTRL_TYPE_BOOLEAN,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_af_available",
+        .step = 1,
+        .min  = 0,
+        .max  = 1,
+    },
+	{
+		/* uint16_t 3x4x16bit */
 		.ops = &hailo15_isp_afv1_ctrl_ops,
 		.id = HAILO15_ISP_CID_AF_WINDOW,
-		.type = V4L2_CTRL_TYPE_U32,
-		.flags = V4L2_CTRL_FLAG_VOLATILE |
-			 V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+		.type = V4L2_CTRL_TYPE_U16,
+		.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.name = "isp_af_window",
 		.step = 1,
 		.min = 0,
-		.max = 0xFFFF,
-		.dims = { 12 },
+		.max  = 4095,
+        .dims = {3, 4, 0, 0},
 	},
 	{
+		/* uint32_t 6x32bit */
 		.ops = &hailo15_isp_afv1_ctrl_ops,
 		.id = HAILO15_ISP_CID_AF_MEASUREMENT,
 		.type = V4L2_CTRL_TYPE_U32,
-		.flags = V4L2_CTRL_FLAG_VOLATILE |
-			 V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+		.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.name = "isp_af_measurement",
 		.step = 1,
 		.min = 0,
 		.max = 0xFFFFFFFF,
+		.def  = 0,
 		.dims = { 6 },
 	},
 

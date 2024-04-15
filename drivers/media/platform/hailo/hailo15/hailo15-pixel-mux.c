@@ -65,11 +65,12 @@ struct pixel_mux_priv {
 	struct v4l2_async_notifier notifier;
 	struct media_pad pads[PIXEL_MUX_PAD_MAX];
 	struct v4l2_mbus_framefmt pad_fmts[PIXEL_MUX_PAD_MAX];
-	struct hailo15_buf_ctx *buf_ctx;
+	int num_exposures;
 
 	/* Remote source */
 	struct v4l2_subdev *source_subdev;
 	int source_pad;
+	int dest_configured;
 };
 
 static const struct v4l2_mbus_framefmt fmt_default = {
@@ -92,7 +93,7 @@ static const struct hailo15_mux_cfg isp_cfg = {
 	.vision_buffer_ready_ap_int_mask = 0x0
 };
 
-static const struct hailo15_mux_cfg p2a_cfg = {
+static const struct hailo15_mux_cfg p2a_cfg_3dol = {
 	.pixel_mux_cfg =
 		P2A0_2_CSIRX0_P2A1_2_CSIRX1_ISP0_2_SW_DBG_ISP1_2_SW_DBG,
 	.isp0_stream0 = DISABLE_VC_4_DT_DISABLE,
@@ -101,7 +102,19 @@ static const struct hailo15_mux_cfg p2a_cfg = {
 	.isp1_stream0 = DISABLE_VC_4_DT_DISABLE,
 	.isp1_stream1 = DISABLE_VC_4_DT_DISABLE,
 	.isp1_stream2 = DISABLE_VC_4_DT_DISABLE,
-	.vision_buffer_ready_ap_int_mask = 0xfff
+	.vision_buffer_ready_ap_int_mask = 0xff4
+};
+
+static const struct hailo15_mux_cfg p2a_cfg_sdr = {
+	.pixel_mux_cfg =
+		P2A0_2_CSIRX0_P2A1_2_CSIRX1_ISP0_2_SW_DBG_ISP1_2_SW_DBG,
+	.isp0_stream0 = DISABLE_VC_4_DT_DISABLE,
+	.isp0_stream1 = DISABLE_VC_4_DT_DISABLE,
+	.isp0_stream2 = DISABLE_VC_4_DT_DISABLE,
+	.isp1_stream0 = DISABLE_VC_4_DT_DISABLE,
+	.isp1_stream1 = DISABLE_VC_4_DT_DISABLE,
+	.isp1_stream2 = DISABLE_VC_4_DT_DISABLE,
+	.vision_buffer_ready_ap_int_mask = 0xff1
 };
 
 static const struct hailo15_mux_interrupt_cfg int_cfg = {
@@ -225,7 +238,7 @@ static int pixel_mux_s_stream(struct v4l2_subdev *sd, int enable)
 	if (!pixel_mux)
 		return -EINVAL;
 
-	if (enable) {
+	if (enable && !pixel_mux->dest_configured) {
 		// TODO - remove this when we have the ability to make clocks that are not in the same heirarchy depend on each other (MSW-2254)
 		dev_dbg(pixel_mux->dev, "%s enabling csi_rx0_xtal_clk\n",
 			__func__);
@@ -240,11 +253,21 @@ static int pixel_mux_s_stream(struct v4l2_subdev *sd, int enable)
 		    sd->grp_id == VID_GRP_ISP_SP) {
 			hailo_pixel_mux_configure_dest(pixel_mux, &isp_cfg);
 		} else if (sd->grp_id == VID_GRP_P2A) {
-			hailo_pixel_mux_configure_dest(pixel_mux, &p2a_cfg);
+			if (pixel_mux->num_exposures == 3)
+				hailo_pixel_mux_configure_dest(pixel_mux,
+							       &p2a_cfg_3dol);
+			else
+				hailo_pixel_mux_configure_dest(pixel_mux,
+							       &p2a_cfg_sdr);
 		} else {
 			ret = -EINVAL;
 			goto err_bad_src_grp;
 		}
+		pixel_mux->dest_configured = 1;
+	} 
+
+	if(!enable){
+		pixel_mux->dest_configured = 0;
 	}
 
 	pad = &pixel_mux->pads[0];
@@ -306,6 +329,18 @@ static int pixel_mux_set_fmt(struct v4l2_subdev *sd,
 	if (!dst_format)
 		return -EINVAL;
 	*dst_format = *src_format;
+
+	switch (src_format->code) {
+	case MEDIA_BUS_FMT_SRGGB12_1X12:
+		pixel_mux->num_exposures = 1;
+		break;	
+	case MEDIA_BUS_FMT_SRGGB12_3X12:
+		pixel_mux->num_exposures = 3;
+		break;
+	default:
+		pixel_mux->num_exposures = 1;
+		break;
+	}
 	
 	/* change format to one of two: x16 or x32 */
 	if (sd->grp_id == VID_GRP_ISP_MP ||
@@ -318,7 +353,7 @@ static int pixel_mux_set_fmt(struct v4l2_subdev *sd,
 		goto err_bad_src_grp;
 	}
 
-	/* Propagate format to sink */
+	/* Propagate fake format to sink */
 	sink_pad_idx = (int)(fmt->pad/2);
 	pad = &pixel_mux->pads[sink_pad_idx];
 	if (pad)
@@ -417,10 +452,6 @@ static int hailo15_init_dma_ctx(struct hailo15_dma_ctx *ctx,
 				struct pixel_mux_priv *pixel_mux)
 {
 	ctx->dev = (void *)pixel_mux;
-	spin_lock_init(&ctx->buf_ctx.irqlock);
-	INIT_LIST_HEAD(&ctx->buf_ctx.dmaqueue);
-	ctx->buf_ctx.ops = NULL;
-	pixel_mux->buf_ctx = &ctx->buf_ctx;
 	v4l2_set_subdevdata(&pixel_mux->subdev, ctx);
 	return 0;
 }

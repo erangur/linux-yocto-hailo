@@ -7,7 +7,19 @@
 
 #define HAILO15_VIDEO_EVENT_RESOURCE_SIZE 4096
 #define HAILO15_DEAMON_VIDEO_EVENT (V4L2_EVENT_PRIVATE_START + 1000)
-#define HAILO15_DAEMON_ISP_EVENT (V4L2_EVENT_PRIVATE_START + 2000)
+#define HAILO15_DAEMON_ISP_EVENT   (V4L2_EVENT_PRIVATE_START + 2000)
+#define HAILO15_ISP_IRQ_EVENT      (V4L2_EVENT_PRIVATE_START + 3000)
+
+#define HAILO15_UEVENT_ISP_STAT    HAILO15_DAEMON_ISP_EVENT
+
+enum hailo15_event_isp_stat_id {
+    HAILO15_UEVENT_ISP_EXP_STAT,
+    HAILO15_UEVENT_ISP_EXPV2_STAT,
+    HAILO15_UEVENT_ISP_HIST_STAT,
+    HAILO15_UEVENT_ISP_AWB_STAT,
+    HAILO15_UEVENT_ISP_AFM_STAT,
+    HAILO15_UEVENT_ISP_STAT_MAX
+};
 
 struct hailo15_af_kevent {
 	wait_queue_head_t wait_q;
@@ -84,19 +96,5 @@ struct hailo15_isp_ctrl {
 	char data[0];
 };
 
-struct hailo15_video_event_data {
-	uint32_t pad;
-	uint8_t dev;
-	uint32_t event_id;
-	uint64_t phy_addr;
-	uint64_t size;
-	uint32_t data_size;
-};
-
-struct hailo15_video_event_shm {
-	uint32_t complete;
-	int32_t result;
-	char data[0];
-};
 
 #endif

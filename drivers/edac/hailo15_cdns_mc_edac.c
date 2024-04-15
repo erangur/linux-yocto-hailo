@@ -345,13 +345,13 @@ static enum dev_type cdns_get_dtype(struct cdns_edac_priv *priv)
 }
 
 /**
- * cdns_get_ecc_state - Return the controller ECC enable/disable status.
+ * is_ecc_enabled - Return the controller ECC enable/disable status.
  *
  * @param priv:	private instance data.
  *
  * Return: true(ECC enabled), false(ECC disabled).
  */
-static bool cdns_get_ecc_state(struct cdns_edac_priv *priv)
+static bool is_ecc_enabled(struct cdns_edac_priv *priv)
 {
 	enum dev_type dt;
 	enum ddr_ctrl_ecc_mode ecc_mode;
@@ -401,8 +401,6 @@ static enum mem_type cdns_get_mtype(struct cdns_edac_priv *priv)
 	u32 ctrl_id = ddr_ctrl_reg32_rd(priv->ddr_ctrl_base, CONTROLLER_ID);
 
 	if (ctrl_id != 0x1046) {
-		edac_printk(KERN_ERR, EDAC_MC,
-			    "Unsupported memory controller.\n");
 		return MEM_UNKNOWN;
 	}
 	return MEM_LPDDR4;
@@ -442,30 +440,13 @@ static void init_csrows(struct mem_ctl_info *mci)
 /**
  * mc_init - Initialize one driver instance.
  * @mci:	EDAC memory controller instance.
- * @pdev:	platform device.
  *
  * Perform initialization of the EDAC memory controller instance and
  * related driver-private data associated with the memory controller the
  * instance is bound to.
  */
-static int mc_init(struct mem_ctl_info *mci, struct platform_device *pdev)
+static void mc_init(struct mem_ctl_info *mci)
 {
-	struct cdns_edac_priv *priv;
-
-	mci->pdev = &pdev->dev;
-	priv = mci->pvt_info;
-
-	//platform_set_drvdata(pdev, mci);
-
-	if (cdns_get_mtype(priv) == MEM_UNKNOWN) {
-		return -ENODEV;
-	}
-
-	if (!cdns_get_ecc_state(priv)) {
-		edac_printk(KERN_INFO, EDAC_MC, "ECC not enabled\n");
-		return -ENODEV;
-	}
-
 	/* Initialize controller capabilities and configuration */
 	mci->mtype_cap = MEM_FLAG_LPDDR4;
 	mci->edac_ctl_cap = EDAC_FLAG_NONE | EDAC_FLAG_SECDED;
@@ -483,8 +464,6 @@ static int mc_init(struct mem_ctl_info *mci, struct platform_device *pdev)
 	mci->ctl_page_to_phys = NULL;
 
 	init_csrows(mci);
-
-	return 0;
 }
 
 static const struct of_device_id cdns_edac_match[] = {
@@ -529,19 +508,27 @@ static int mc_probe(struct platform_device *pdev)
 			    sizeof(struct cdns_edac_priv));
 	if (!mci) {
 		edac_printk(KERN_ERR, EDAC_MC,
-			    "Failed memory allocation for mc instance\n");
+			"%s failed to allocate edac_mc_alloc.\n", pdev->name);
 		return -ENOMEM;
 	}
+	platform_set_drvdata(pdev, mci);
 
 	priv = mci->pvt_info;
 	priv->ddr_ctrl_base = ddr_ctrl_base;
 
-	rc = mc_init(mci, pdev);
-	if (rc) {
-		edac_printk(KERN_ERR, EDAC_MC,
-			    "Failed to Init EDAC memory controller instance\n");
+	if (cdns_get_mtype(priv) == MEM_UNKNOWN) {
+		edac_printk(KERN_ERR, EDAC_MC, "%s unsupported memory controller.\n", pdev->name);
+		rc = -ENODEV;
 		goto free_edac_mc;
 	}
+
+	if (!is_ecc_enabled(priv)) {
+		edac_printk(KERN_INFO, EDAC_MC, "%s ECC not enabled.\n", pdev->name);
+		rc = -ENODEV;
+		goto free_edac_mc;
+	}
+
+	mc_init(mci);
 
 	rc = edac_mc_add_mc(mci);
 	if (rc) {

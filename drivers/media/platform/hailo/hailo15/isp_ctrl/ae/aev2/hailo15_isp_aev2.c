@@ -81,6 +81,10 @@ static int hailo15_isp_aev2_s_ctrl(struct v4l2_ctrl *ctrl)
 	case HAILO15_ISP_CID_AE_INTEGRATION_TIME:
 	case HAILO15_ISP_CID_AE_IRIS:
 	case HAILO15_ISP_CID_AE_IRIS_LIMITS:
+	case HAILO15_ISP_CID_AE_HIST_MODE:
+	case HAILO15_ISP_CID_AE_HIST_WINDOW:
+	case HAILO15_ISP_CID_AE_HIST_WEIGHT:
+	case HAILO15_ISP_CID_AE_EXP_WINDOW:
 		pr_debug("%s - got s_ctrl with id: 0x%x\n", __func__, ctrl->id);
 		ret = hailo15_isp_s_ctrl_event(isp_dev, isp_dev->ctrl_pad,
 					       ctrl);
@@ -122,6 +126,12 @@ static int hailo15_isp_aev2_g_ctrl(struct v4l2_ctrl *ctrl)
 	case HAILO15_ISP_CID_AE_IRIS_LIMITS:
 	case HAILO15_ISP_CID_AE_FPS:
 	case HAILO15_ISP_CID_AE_CONVERGED:
+	case HAILO15_ISP_CID_AE_HIST_MODE:
+	case HAILO15_ISP_CID_AE_HIST_WINDOW:
+	case HAILO15_ISP_CID_AE_HIST_WEIGHT:
+	case HAILO15_ISP_CID_AE_EXP_INPUT:
+	case HAILO15_ISP_CID_AE_EXP_WINDOW:
+	case HAILO15_ISP_CID_AE_EXP_STATISTIC:
 		pr_debug("%s - got g_ctrl with id: 0x%x\n", __func__, ctrl->id);
 		ret = hailo15_isp_g_ctrl_event(isp_dev, isp_dev->ctrl_pad,
 					       ctrl);
@@ -394,7 +404,76 @@ const struct v4l2_ctrl_config hailo15_isp_aev2_ctrls[] = {
 		.min = 0,
 		.max = 100,
 	},
-
+	{
+        .ops  = &hailo15_isp_aev2_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AE_HIST_MODE,
+        .type = V4L2_CTRL_TYPE_INTEGER,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_ae_hist_mode",
+        .step = 1,
+        .min  = 1,
+        .max  = 5,
+        .def  = 1,
+    },
+    {
+        /* uint16_t array 4*16bit*/
+        .ops  = &hailo15_isp_aev2_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AE_HIST_WINDOW,
+        .type = V4L2_CTRL_TYPE_U16,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_ae_hist_window",
+        .step = 1,
+        .min  = 0,
+        .max  = 0xFFFF,
+        .dims = {4},
+    },
+    {
+        /* uint8_t array 25*8bit*/
+        .ops  = &hailo15_isp_aev2_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AE_HIST_WEIGHT,
+        .type = V4L2_CTRL_TYPE_U8,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_ae_hist_weight",
+        .step = 1,
+        .min  = 0,
+        .max  = 0x10,
+        .dims = {25},
+    },
+    {
+        .ops  = &hailo15_isp_aev2_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AE_EXP_INPUT,
+        .type = V4L2_CTRL_TYPE_INTEGER,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_ae_exp_input",
+        .step = 1,
+        .min  = 0,
+        .max  = 2,
+        .def  = 1,
+    },
+    {
+        /* uint16_t array 4*16bit*/
+        .ops  = &hailo15_isp_aev2_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AE_EXP_WINDOW,
+        .type = V4L2_CTRL_TYPE_U16,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_ae_exp_window",
+        .step = 1,
+        .min  = 0,
+        .max  = 0xFFFF,
+        .dims = {4},
+    },
+    {
+        /* uint8_t array 4096*8bit*/
+        .ops  = &hailo15_isp_aev2_ctrl_ops,
+        .id   = HAILO15_ISP_CID_AE_EXP_STATISTIC,
+        .type = V4L2_CTRL_TYPE_U8,
+        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+        .name = "isp_ae_exp_statistic",
+        .step = 1,
+        .min  = 0,
+        .max  = 0xFF,
+        .dims = {4096},
+    }
 };
 
 int hailo15_isp_aev2_ctrl_count(void)

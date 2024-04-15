@@ -50,6 +50,33 @@ void hailo15_config_isp_wrapper(struct hailo15_isp_device *isp_dev)
 				      ERR_INT_SET_ALL);
 }
 
+static void hailo15_isp_configure_mcm_rdma(struct hailo15_isp_device* isp_dev){
+
+	int width, height;
+	uint32_t mi_mcm_ctrl, mcm_rd_cfg, mi_ctrl, mi_mcm_fmt, mi_imsc;
+	width = isp_dev->input_fmt.format.width;
+	height = isp_dev->input_fmt.format.height;
+	mi_ctrl = hailo15_isp_read_reg(isp_dev, MI_CTRL);
+	mi_ctrl &= ~MI_CTRL_MCM_RAW_RDMA_START_CON;
+	mi_ctrl |= MI_CTRL_MCM_RAW_RDMA_PATH_ENABLE;
+	hailo15_isp_write_reg(isp_dev, MI_CTRL, mi_ctrl);
+	mi_mcm_ctrl = hailo15_isp_read_reg(isp_dev, MI_MCM_CTRL);
+	hailo15_isp_write_reg(isp_dev, MI_MCM_DMA_RAW_PIC_WIDTH, width);
+	hailo15_isp_write_reg(isp_dev, MI_MCM_DMA_RAW_PIC_LLENGTH, width*sizeof(uint16_t));
+	hailo15_isp_write_reg(isp_dev, MI_MCM_DMA_RAW_PIC_LVAL, width*sizeof(uint16_t));
+	hailo15_isp_write_reg(isp_dev, MI_MCM_DMA_RAW_PIC_SIZE, width*height*sizeof(uint16_t));
+	mcm_rd_cfg = hailo15_isp_read_reg(isp_dev, MCM_RD_CFG);
+	mcm_rd_cfg = MCM_RD_FMT;
+	hailo15_isp_write_reg(isp_dev, MCM_RD_CFG, mcm_rd_cfg);
+	mi_mcm_fmt = hailo15_isp_read_reg(isp_dev, MI_MCM_FMT);
+	mi_mcm_fmt |= MCM_RD_RAW_BIT;
+	hailo15_isp_write_reg(isp_dev, MI_MCM_FMT, mi_mcm_fmt);
+	hailo15_isp_write_reg(isp_dev, MI_MCM_CTRL, mi_mcm_ctrl | MCM_RD_CFG_UPD);
+	mi_imsc = hailo15_isp_read_reg(isp_dev, MI_IMSC);
+	mi_imsc |= MCM_DMA_RAW_READY;
+	hailo15_isp_write_reg(isp_dev, MI_IMSC, mi_imsc);
+}
+
 void hailo15_isp_configure_frame_size(struct hailo15_isp_device *isp_dev,
 				      int path)
 {
@@ -60,6 +87,11 @@ void hailo15_isp_configure_frame_size(struct hailo15_isp_device *isp_dev,
 
 	if (path >= ISP_MAX_PATH || path < 0)
 		return;
+	
+	if(path == ISP_MCM_IN){
+		hailo15_isp_configure_mcm_rdma(isp_dev);
+		return;
+	}
 
 	y_size_init_addr =
 		path == ISP_MP ? MI_MP_Y_SIZE_INIT : MI_SP2_Y_SIZE_INIT;
@@ -107,6 +139,9 @@ int hailo15_isp_is_path_enabled(struct hailo15_isp_device *isp_dev, int path)
 
 	if (path >= ISP_MAX_PATH || path < 0)
 		return 0;
+	
+	if(path == ISP_MCM_IN)
+		return isp_dev->rdma_enable;
 
 	enabled_mask = path == ISP_MP ? MP_YCBCR_PATH_ENABLE_MASK :
 					SP2_YCBCR_PATH_ENABLE_MASK;
@@ -114,6 +149,25 @@ int hailo15_isp_is_path_enabled(struct hailo15_isp_device *isp_dev, int path)
 	mi_ctrl = hailo15_isp_read_reg(isp_dev, MI_CTRL);
 
 	return !!(mi_ctrl & enabled_mask);
+}
+static inline void
+hailo15_isp_configure_rdma_frame_base(struct hailo15_isp_device *isp_dev,
+				    dma_addr_t addr[FMT_MAX_PLANES])
+{
+	int mi_ctrl;
+	int mi_mcm_ctrl;
+	struct isp_fe_switch_t fe_switch;
+	memset(&fe_switch, 0, sizeof(fe_switch));
+	fe_switch.vd_mode = 1;
+	hailo15_isp_write_reg(isp_dev, MIV2_MCM_DMA_RAW_PIC_START_AD, addr[PLANE_Y]);
+	mi_mcm_ctrl = hailo15_isp_read_reg(isp_dev, MI_MCM_CTRL);
+	mi_mcm_ctrl |= MCM_RD_CFG_UPD;
+	hailo15_isp_write_reg(isp_dev, MI_MCM_CTRL, mi_mcm_ctrl);
+	mi_ctrl = hailo15_isp_read_reg(isp_dev, MI_CTRL);
+	mi_ctrl |= MI_CTRL_MCM_RAW_RDMA_START;
+	hailo15_isp_write_reg(isp_dev, MI_CTRL, mi_ctrl);
+
+	isp_dev->fe_dev->fe_switch(isp_dev->fe_dev, &fe_switch);
 }
 
 static inline void
@@ -146,6 +200,10 @@ void hailo15_isp_configure_frame_base(struct hailo15_isp_device *isp_dev,
 
 	if (ISP_SP2 == pad) {
 		hailo15_isp_configure_sp2_frame_base(isp_dev, addr);
+	}
+
+	if(ISP_MCM_IN == pad){
+		hailo15_isp_configure_rdma_frame_base(isp_dev, addr);
 	}
 }
 EXPORT_SYMBOL(hailo15_isp_configure_frame_base);
@@ -247,6 +305,34 @@ static inline int __hailo15_isp_frame_rx_sp2(int miv2_mis)
 	return !!(miv2_mis & MIV2_SP2_YCBCR_FRAME_END_MASK);
 }
 
+static inline int __hailo15_isp_frame_rx_rdma_ready(int miv2_mis)
+{
+	return !!(miv2_mis & MIV2_MCM_DMA_RAW_READY_MASK);
+}
+
+static void hailo15_isp_handle_frame_rx_rdma(struct hailo15_isp_device *isp_dev,
+					     int irq_status)
+{
+	if(!isp_dev->mcm_mode)
+		return;
+	
+	if(__hailo15_isp_frame_rx_rdma_ready(irq_status)){
+		isp_dev->dma_ready = 1;
+	}
+
+	if(__hailo15_isp_frame_rx_mp(irq_status) || __hailo15_isp_frame_rx_sp2(irq_status)){
+		isp_dev->frame_end = 1;
+	}
+	
+	if(isp_dev->frame_end && isp_dev->dma_ready && isp_dev->fe_ready){
+		/* do rx_rdma */
+		hailo15_isp_buffer_done(isp_dev, ISP_MCM_IN);
+		isp_dev->dma_ready = 0;
+		isp_dev->frame_end = 0;
+		isp_dev->fe_ready = 0;
+	}
+}
+
 static void hailo15_isp_handle_frame_rx_mp(struct hailo15_isp_device *isp_dev,
 					   int irq_status)
 {
@@ -278,6 +364,7 @@ static void hailo15_isp_handle_frame_rx(struct hailo15_isp_device *isp_dev,
 {
 	hailo15_isp_handle_frame_rx_mp(isp_dev, irq_status);
 	hailo15_isp_handle_frame_rx_sp2(isp_dev, irq_status);
+	hailo15_isp_handle_frame_rx_rdma(isp_dev, irq_status);
 }
 
 void hailo15_isp_handle_afm_int(struct work_struct *work)
@@ -367,6 +454,11 @@ static void hailo15_isp_handle_int(struct hailo15_isp_device *isp_dev)
 		raised_irq_count++;
 	}
 
+	if(isp_dev->rdma_enable){
+		isp_dev->irq_status.isp_miv2_mis &= ~MIV2_MCM_RAW0_FRAME_END;
+		isp_dev->irq_status.isp_miv2_mis &= ~MIV2_MCM_DMA_RAW_READY_MASK;
+	}
+
 	isp_dev->irq_status.isp_miv2_mis1 =
 		hailo15_isp_read_reg(isp_dev, MIV2_MIS1);
 	hailo15_isp_write_reg(isp_dev, MIV2_ICR1,
@@ -383,6 +475,10 @@ static void hailo15_isp_handle_int(struct hailo15_isp_device *isp_dev)
 
 		if(isp_dev->fe_dev)
 			isp_dev->fe_dev->fe_dma_irq(isp_dev->fe_dev);
+
+		if(isp_dev->irq_status.isp_fe & 1){
+			isp_dev->fe_ready = 1;
+		}
 	}
 
 	event_size = hailo15_isp_get_event_queue_size(isp_dev);

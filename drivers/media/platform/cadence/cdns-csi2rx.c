@@ -296,6 +296,8 @@ static int csi2rx_start(struct csi2rx_priv *csi2rx)
 	unsigned long lanes_used = 0;
 	u32 reg;
 	int ret;
+	u32 csi2rx_stream_cfg_flags = 0;
+	u32 csi2rx_stream_cfg_fifo_fill_level = 0;
 
 	// see if the mode changed before the stream
 	ret = __v4l2_ctrl_handler_setup(csi2rx->subdev.ctrl_handler);
@@ -366,19 +368,19 @@ static int csi2rx_start(struct csi2rx_priv *csi2rx)
 
 		writel(CSI2RX_STREAM_CTRL_SOFT_RESET,
 		       csi2rx->base + CSI2RX_STREAM_CTRL_REG(i));
-		if(csi2rx->cur_mode == CSI2RX_MODE_SDR){
-			u32 csi2rx_stream_cfg_flags = CSI2RX_STREAM_CFG_FIFO_MODE_LARGE_BUF;
-			csi2rx_stream_cfg_flags |= fmt->bpp == 2 ? CSI2RX_STREAM_CFG_2_PPC : 0;
-			pr_debug("%s - mode sdr set fill level to 0\n", __func__);
-			writel(csi2rx_stream_cfg_flags,
-				csi2rx->base + CSI2RX_STREAM_CFG_REG(i));
-		}
-		else {
+		
+		csi2rx_stream_cfg_flags = CSI2RX_STREAM_CFG_FIFO_MODE_LARGE_BUF;
+		csi2rx_stream_cfg_flags |= fmt->bpp == 2 ? CSI2RX_STREAM_CFG_2_PPC : 0;
+
+		if (csi2rx->cur_mode == CSI2RX_MODE_HDR && mfmt->code == MEDIA_BUS_FMT_SRGGB12_1X32) {
+			// TODO MSW-4940: support rggb10: generalize csi2rx_stream_cfg_fifo_fill_level calculation
+			csi2rx_stream_cfg_fifo_fill_level |= (mfmt->width * 3 / 2) << 16;
 			pr_debug("%s - mode hdr set fill level to 0x%x\n", 
-			__func__, CSI2RX_STREAM_CFG_FIFO_FILL_LEVEL);
-			writel(CSI2RX_STREAM_CFG_FIFO_FILL_LEVEL | CSI2RX_STREAM_CFG_FIFO_MODE_LARGE_BUF,
-				csi2rx->base + CSI2RX_STREAM_CFG_REG(i));
+			__func__, csi2rx_stream_cfg_fifo_fill_level);
+			csi2rx_stream_cfg_flags |= csi2rx_stream_cfg_fifo_fill_level;
 		}
+		writel(csi2rx_stream_cfg_flags,
+				csi2rx->base + CSI2RX_STREAM_CFG_REG(i));
 
 		writel(CSI2RX_STREAM_DATA_CFG_DT0_PROCESS_ENABLE |
 			       CSI2RX_STREAM_DATA_CFG_DT0_RAW12,
@@ -441,6 +443,11 @@ static void csi2rx_stop(struct csi2rx_priv *csi2rx)
 
 	if (v4l2_subdev_call(csi2rx->source_subdev, video, s_stream, false))
 		dev_warn(csi2rx->dev, "Couldn't disable our subdev\n");
+
+	// sanity clean register
+	for (i = 0; i < csi2rx->max_streams; i++) {
+		writel((u32)0x0, csi2rx->base + CSI2RX_STREAM_CFG_REG(i));
+	}
 }
 
 static int csi2rx_s_stream(struct v4l2_subdev *subdev, int enable)

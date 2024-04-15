@@ -33,6 +33,10 @@
 #include "common.h"
 #include "notify.h"
 
+#ifdef CONFIG_ARCH_HAILO15
+#include <dt-bindings/soc/hailo15_scu_fw_version.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/scmi.h>
 
@@ -1874,8 +1878,16 @@ static int scmi_probe(struct platform_device *pdev)
 	 * against the actual version
 	 */
 	if (!of_property_read_u32(np, "fw-ver", &fw_ver)) {
+#ifdef CONFIG_ARCH_HAILO15
+		if (SCU_FW_BUILD_VERSION != handle->version->impl_ver) {
+			dev_err(dev, "Firmware version mismatch: linux(kernel)=0x%x, fw=0x%x\n",
+				 SCU_FW_BUILD_VERSION,
+				 handle->version->impl_ver);
+			goto notification_exit;
+		}
+#endif
 		if (fw_ver != handle->version->impl_ver) {
-			dev_err(dev, "Firmware version mismatch: expected=0x%x, actual=0x%x\n",
+			dev_err(dev, "Firmware version mismatch: linux(devicetree)=0x%x, fw=0x%x\n",
 				fw_ver,
 				handle->version->impl_ver);
 			goto notification_exit;

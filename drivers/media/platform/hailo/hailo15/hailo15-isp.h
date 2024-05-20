@@ -96,34 +96,8 @@ enum { ISP_MP,
        ISP_MAX_PATH,
 };
 
-struct hailo15_isp_mbus_fmt {
-	uint32_t code;
-};
-
-struct hailo15_isp_fmt_size {
-	uint32_t image_size;
-	uint32_t num_planes;
-	uint32_t planes_size[VIDEO_MAX_PLANES];
-	uint32_t planes_offset[VIDEO_MAX_PLANES];
-
-};
-
 struct hailo15_isp_pad_data {
-	uint32_t sink_detected;
-	struct v4l2_mbus_framefmt format;
-	struct hailo15_isp_fmt_size fmt_size;
-	struct v4l2_fract frmival_min;
-    struct v4l2_fract frmival_max;
-	uint32_t num_formats;
-	struct hailo15_isp_mbus_fmt *mbus_fmt;
-	struct list_head queue;
-	struct list_head mcm_queue;
-	spinlock_t qlock;
 	uint32_t stream;
-	struct hailo15_vb2_buffer *buf;
-	struct hailo15_vb2_buffer *shd_buf;
-	struct v4l2_rect crop;
-	struct v4l2_rect compose;
 	uint32_t sequence;
 	struct hailo15_pad_stat_subscribe stat_sub[HAILO15_UEVENT_ISP_STAT_MAX];
 };
@@ -184,18 +158,19 @@ struct hailo15_isp_device {
 	int dma_ready;
 	int frame_end;
 	int fe_ready;
+	int fe_enable;
 };
 
 
 void hailo15_isp_private_entity_init(struct hailo15_isp_device *isp_dev);
 void hailo15_isp_pad_handle_init(struct hailo15_isp_device *isp_dev);
-irqreturn_t isp_irq_process(struct hailo15_isp_device *isp_dev);
 int isp_hal_set_pad_stream(struct hailo15_isp_device *isp_dev,
 			   uint32_t pad_index, int status);
 void hailo15_isp_buffer_done(struct hailo15_isp_device *, int path);
 void hailo15_config_isp_wrapper(struct hailo15_isp_device *isp_dev);
 int hailo15_isp_is_path_enabled(struct hailo15_isp_device *, int);
 int hailo15_isp_dma_set_enable(struct hailo15_isp_device *, int, int);
+void hailo15_isp_reset_hw(struct hailo15_isp_device*);
 int hailo15_isp_post_event_set_fmt(struct hailo15_isp_device *isp_dev,
 				     int pad,
 				     struct v4l2_mbus_framefmt *format);
@@ -208,4 +183,7 @@ int hailo15_isp_s_ctrl_event(struct hailo15_isp_device *isp_dev, int pad,
 			     struct v4l2_ctrl *ctrl);
 int hailo15_isp_g_ctrl_event(struct hailo15_isp_device *isp_dev, int pad,
 			     struct v4l2_ctrl *ctrl);
+irqreturn_t isp_irq_process(struct hailo15_isp_device *isp_dev);
+irqreturn_t hailo15_process_irq_stats_events(struct hailo15_isp_device *isp_dev,
+    int event_id, uint32_t mis);
 #endif

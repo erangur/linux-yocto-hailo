@@ -4,7 +4,9 @@
  *
  * Copyright (C) 2021 Intel Corporation
  */
+#include "imx678.h"
 #include <asm/unaligned.h>
+#include <linux/videodev2.h>
 
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -16,6 +18,7 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
 #include <linux/kernel.h>
+#include "sensor_id.h"
 
 #define DEFAULT_MODE_IDX 0
 
@@ -28,22 +31,35 @@
 #define IMX678_REG_LPFR 0x3028 // VMAX
 #define IMX678_MAX_LPFR_4K (1 << 20) - 2 - 2160 // max even value of unsigned 20bit - 4k #lines
 
-/* Chip ID */
-#define IMX678_REG_ID 0x0
-// #define IMX678_REG_ID		0x4d1c
-#define IMX678_ID 0xa6 // from SupportPackage_E_Rev2.0 20p
-
-/* Exposure control */
-#define IMX678_REG_SHUTTER 0x3050
-#define IMX678_EXPOSURE_MIN 1
-#define IMX678_EXPOSURE_OFFSET 5
-#define IMX678_EXPOSURE_STEP 1
+/* defaults */
+#define IMX678_DEFAULT_RHS1 0x91
+#define IMX678_DEFAULT_RHS2 0xaa
 #define IMX678_EXPOSURE_DEFAULT 0x0648
+
+/* gaps */
+#define IMX678_SHR0_RHS2_GAP 7
+#define IMX678_SHR0_FSC_GAP 3
+#define IMX678_SHR1_MIN_GAP 7
+#define IMX678_SHR1_RHS1_GAP 3
+#define IMX678_SHR2_RHS1_GAP 7
+#define IMX678_SHR2_RHS2_GAP 3
+
+/* Exposure control LEF */
+#define IMX678_REG_SHUTTER 0x3050
+#define IMX678_EXPOSURE_STEP 1
+
+/* Exposure control SEF1 */
+#define IMX678_REG_SHUTTER_SHORT 0x3054
+#define IMX678_EXPOSURE_SHORT_STEP 1
+
+/* Exposure control SEF2 */
+#define IMX678_REG_SHUTTER_VERY_SHORT 0x3058
+#define IMX678_EXPOSURE_VERY_SHORT_STEP 1
 
 /* Analog gain control */
 #define IMX678_REG_AGAIN 0x3070
-#define IMX678_REG_AGAIN1 0x3072
-#define IMX678_REG_AGAIN2 0x3074
+#define IMX678_REG_AGAIN_SHORT 0x3072
+#define IMX678_REG_AGAIN_VERY_SHORT 0x3074
 #define IMX678_AGAIN_MIN 0
 #define IMX678_AGAIN_MAX 240
 #define IMX678_AGAIN_STEP 1
@@ -71,6 +87,18 @@
 #define IMX678_TPG_EN_DUOUT 0x30e0 /* TEST PATTERN ENABLE */
 #define IMX678_TPG_PATSEL_DUOUT 0x30e2 /*Patsel mode */
 #define IMX678_TPG_COLOR_WIDTH 0x30e4 /*color width */
+
+#define NON_NEGATIVE(val) ((val) < 0 ? 0 : (val))
+#define MAX(val1, val2) ((val1) < val2 ? val2 : (val1))
+
+static u32 imx678_reg_shutter[3] = {IMX678_REG_SHUTTER, IMX678_REG_SHUTTER_SHORT, IMX678_REG_SHUTTER_VERY_SHORT};
+static u32 imx678_reg_again[3] = {IMX678_REG_AGAIN, IMX678_REG_AGAIN_SHORT, IMX678_REG_AGAIN_VERY_SHORT};
+
+typedef enum {
+  LEF,
+  SEF1,
+  SEF2,
+} ExposureType;
 
 static int imx678_set_ctrl(struct v4l2_ctrl *ctrl);
 
@@ -136,6 +164,29 @@ struct imx678_reg_list {
 	const struct imx678_reg *regs;
 };
 
+u32 _get_mode_reg_val_by_address(const struct imx678_reg_list *reg_list, u16 reg_address, int num_bytes) {
+	u32 left = 0;
+	u32 right = reg_list->num_of_regs - 1;
+	u32 val = 0;
+	int i = 0;
+	while (left <= right) {
+		u32 mid = left + (right - left) / 2;
+		if (reg_list->regs[mid].address == reg_address) {
+		val = 0;
+		for (i = 0; i < num_bytes; i++) {
+			val |= (reg_list->regs[mid + i].val >> 8*i) & 0xff;
+		}
+		return val;
+		}
+		if (reg_list->regs[mid].address < reg_address) {
+			left = mid + 1;
+		} else {
+			right = mid - 1;
+		}
+	}
+	return 0;
+}
+
 /**
  * struct imx678_mode - imx678 sensor mode structure
  * @width: Frame width
@@ -159,8 +210,27 @@ struct imx678_mode {
 	u32 vblank_max;
 	u64 pclk;
 	u32 link_freq_idx;
+	u32 rhs1;
+	u32 rhs2;
 	struct imx678_reg_list reg_list;
 	struct v4l2_fract frame_interval;
+};
+
+int compare_imx678_mode(const struct imx678_mode *mode1, const struct imx678_mode *mode2) {
+	bool not_equal = (mode1->width != mode2->width) ||
+           (mode1->height != mode2->height) ||
+           (mode1->code != mode2->code) ||
+           (mode1->hblank != mode2->hblank) ||
+           (mode1->vblank != mode2->vblank) ||
+           (mode1->vblank_min != mode2->vblank_min) ||
+           (mode1->vblank_max != mode2->vblank_max) ||
+           (mode1->pclk != mode2->pclk);
+	return not_equal;
+}
+
+struct exp_gain_ctrl_cluster {
+	struct v4l2_ctrl *exp_ctrl;
+	struct v4l2_ctrl *again_ctrl;
 };
 
 /**
@@ -199,10 +269,9 @@ struct imx678 {
 	struct v4l2_ctrl *vblank_ctrl;
 	struct v4l2_ctrl *test_pattern_ctrl;
 	struct v4l2_ctrl *mode_sel_ctrl;
-	struct {
-		struct v4l2_ctrl *exp_ctrl;
-		struct v4l2_ctrl *again_ctrl;
-	};
+	struct exp_gain_ctrl_cluster lef;
+	struct exp_gain_ctrl_cluster sef1;
+	struct exp_gain_ctrl_cluster sef2;
 	u32 vblank;
 	const struct imx678_mode *cur_mode;
 	struct mutex mutex;
@@ -236,6 +305,8 @@ static const struct imx678_reg mode_3840x2160_regs[] = {
 	{0x3044, 0x00}, // PIX_VST=00				*imx678
 	{0x3046, 0x70}, // PIX_VWIDTH_LSB=2160		*imx678
 	{0x3047, 0x08}, // PIX_VWIDTH_MSB			*imx678
+	{0x3050, 0x03},
+	{0x3051, 0x00},
 	{0x30a6, 0x00}, // XVS_DRV, XHS_DRV			*imx678
 	{0x3460, 0x22},
 	{0x355A, 0x64},
@@ -717,6 +788,446 @@ static const struct imx678_reg mode_1920x1080_sdr_binning_regs[] = {
     { 0x47C3, 0x01 }, { 0x4E3C, 0x07 }
 };
 
+static const struct imx678_reg mode_4k_3dol_20fps_all_pixel[] = {
+	/* 0x3000: Using default value (STANDBY) */
+	/* 0x3001: Using default value (REGHOLD) */
+	/* 0x3002: Using default value (XMSTA) */
+	{ 0x3014, 0x04 }, /* 0x3014: Using default value (INCK_SEL[3:0]) */ // MANUAL (fix for our clock)
+	{ 0x3015, 0x02 }, /* DATARATE_SEL[3:0] */
+	{ 0x3018, 0x04 }, /* 0x3018: Using default value (WINMODE[4:0]) */ // MANUAL (crop)
+	/* 0x3019: Using default value (CFMODE[1:0]) */
+	{ 0x301A, 0x02 }, /* WDMODE[7:0] */
+	/* 0x301B: Using default value (ADDMODE[1:0]) */
+	{ 0x301C, 0x01 }, /* THIN_V_EN[7:0] */
+	/* 0x301E: Using default value (VCMODE[7:0]) */
+	/* 0x3020: Using default value (HREVERSE) */
+	/* 0x3021: Using default value (VREVERSE) */
+	/* 0x3022: Using default value (ADBIT[1:0]) */
+	{ 0x3023, 0x01 }, /* 0x3023: Using default value (MDBIT) */ // MANUAL (rewrite default)
+	/* 0x3028: Using default value (VMAX[19:0]) */
+	/* 0x3029: Using default value */
+	/* 0x302A: Using default value */
+	{ 0x302C, 0x26 }, /* HMAX[15:0] */
+	{ 0x302D, 0x02 },
+	/* 0x3030: Using default value (FDG_SEL0[1:0]) */
+	/* 0x3031: Using default value (FDG_SEL1[1:0]) */
+	/* 0x3032: Using default value (FDG_SEL2[1:0]) */
+	/* 0x303C: Using default value (PIX_HST[12:0]) */
+	/* 0x303D: Using default value */
+	{ 0x303E, 0x00 }, /* 0x303E: Using default value (PIX_HWIDTH[12:0]) */  // MANUAL (crop 3856 to 3840)
+	{ 0x303F, 0x0F }, /* 0x303F: Using default value */ // MANUAL (crop 3856 to 3840)
+	/* 0x3040: Using default value (LANEMODE[2:0]) */
+	/* 0x3042: Using default value (XSIZE_OVERLAP[10:0]) */
+	/* 0x3043: Using default value */
+	/* 0x3044: Using default value (PIX_VST[11:0]) */
+	/* 0x3045: Using default value */
+	{ 0x3046, 0x70 }, /* 0x3046: Using default value (PIX_VWIDTH[11:0]) */  // MANUAL (crop 2180 to 2160)
+	{ 0x3047, 0x08 }, /* 0x3047: Using default value */  // MANUAL (crop 2180 to 2160)
+	{ 0x3050, 0x18 }, /* SHR0[19:0] */
+	{ 0x3051, 0x15 },
+	/* 0x3052: Using default value */
+	{ 0x3054, 0x07 }, /* SHR1[19:0] */
+	/* 0x3055: Using default value */
+	/* 0x3056: Using default value */
+	{ 0x3058, 0x4A }, /* SHR2[19:0] */
+	{ 0x3059, 0x00 },
+	/* 0x305A: Using default value */
+	{ 0x3060, 0x8e }, /* RHS1[19:0] */
+	{ 0x3061, 0x00 },
+	/* 0x3062: Using default value */
+	{ 0x3064, 0xa7 }, /* RHS2[19:0] */
+	{ 0x3065, 0x00 },
+	/* 0x3066: Using default value */
+	/* 0x3069: Using default value (CHDR_GAIN_EN[7:0]) */
+	/* 0x306B: Using default value */
+	/* 0x3070: Using default value (GAIN[10:0]) */
+	/* 0x3071: Using default value */
+	/* 0x3072: Using default value (GAIN_1[10:0]) */
+	/* 0x3073: Using default value */
+	/* 0x3074: Using default value (GAIN_2[10:0]) */
+	/* 0x3075: Using default value */
+	/* 0x3081: Using default value (EXP_GAIN[7:0]) */
+	/* 0x308C: Using default value (CHDR_DGAIN0_HG[15:0]) */
+	/* 0x308D: Using default value */
+	/* 0x3094: Using default value (CHDR_AGAIN0_LG[10:0]) */
+	/* 0x3095: Using default value */
+	/* 0x309C: Using default value (CHDR_AGAIN0_HG[10:0]) */
+	/* 0x309D: Using default value */
+	/* 0x30A4: Using default value (XVSOUTSEL[1:0]) */
+	{ 0x30A6, 0x00 }, /* XVS_DRV[1:0] */
+	/* 0x30CC: Using default value */
+	/* 0x30CD: Using default value */
+	/* 0x30DC: Using default value (BLKLEVEL[11:0]) */
+	/* 0x30DD: Using default value */
+	/* 0x3400: Using default value (GAIN_PGC_FIDMD) */
+	{ 0x3460, 0x22 },
+	{ 0x355A, 0x64 },
+	{ 0x3A02, 0x7A },
+	{ 0x3A10, 0xEC },
+	{ 0x3A12, 0x71 },
+	{ 0x3A14, 0xDE },
+	{ 0x3A20, 0x2B },
+	{ 0x3A24, 0x22 },
+	{ 0x3A25, 0x25 },
+	{ 0x3A26, 0x2A },
+	{ 0x3A27, 0x2C },
+	{ 0x3A28, 0x39 },
+	{ 0x3A29, 0x38 },
+	{ 0x3A30, 0x04 },
+	{ 0x3A31, 0x04 },
+	{ 0x3A32, 0x03 },
+	{ 0x3A33, 0x03 },
+	{ 0x3A34, 0x09 },
+	{ 0x3A35, 0x06 },
+	{ 0x3A38, 0xCD },
+	{ 0x3A3A, 0x4C },
+	{ 0x3A3C, 0xB9 },
+	{ 0x3A3E, 0x30 },
+	{ 0x3A40, 0x2C },
+	{ 0x3A42, 0x39 },
+	{ 0x3A4E, 0x00 },
+	{ 0x3A52, 0x00 },
+	{ 0x3A56, 0x00 },
+	{ 0x3A5A, 0x00 },
+	{ 0x3A5E, 0x00 },
+	{ 0x3A62, 0x00 },
+	/* 0x3A64: Using default value */
+	{ 0x3A6E, 0xA0 },
+	{ 0x3A70, 0x50 },
+	{ 0x3A8C, 0x04 },
+	{ 0x3A8D, 0x03 },
+	{ 0x3A8E, 0x09 },
+	{ 0x3A90, 0x38 },
+	{ 0x3A91, 0x42 },
+	{ 0x3A92, 0x3C },
+	{ 0x3B0E, 0xF3 },
+	{ 0x3B12, 0xE5 },
+	{ 0x3B27, 0xC0 },
+	{ 0x3B2E, 0xEF },
+	{ 0x3B30, 0x6A },
+	{ 0x3B32, 0xF6 },
+	{ 0x3B36, 0xE1 },
+	{ 0x3B3A, 0xE8 },
+	{ 0x3B5A, 0x17 },
+	{ 0x3B5E, 0xEF },
+	{ 0x3B60, 0x6A },
+	{ 0x3B62, 0xF6 },
+	{ 0x3B66, 0xE1 },
+	{ 0x3B6A, 0xE8 },
+	{ 0x3B88, 0xEC },
+	{ 0x3B8A, 0xED },
+	{ 0x3B94, 0x71 },
+	{ 0x3B96, 0x72 },
+	{ 0x3B98, 0xDE },
+	{ 0x3B9A, 0xDF },
+	{ 0x3C0F, 0x06 },
+	{ 0x3C10, 0x06 },
+	{ 0x3C11, 0x06 },
+	{ 0x3C12, 0x06 },
+	{ 0x3C13, 0x06 },
+	{ 0x3C18, 0x20 },
+	/* 0x3C37: Using default value */
+	{ 0x3C3A, 0x7A },
+	{ 0x3C40, 0xF4 },
+	{ 0x3C48, 0xE6 },
+	{ 0x3C54, 0xCE },
+	{ 0x3C56, 0xD0 },
+	{ 0x3C6C, 0x53 },
+	{ 0x3C6E, 0x55 },
+	{ 0x3C70, 0xC0 },
+	{ 0x3C72, 0xC2 },
+	{ 0x3C7E, 0xCE },
+	{ 0x3C8C, 0xCF },
+	{ 0x3C8E, 0xEB },
+	{ 0x3C98, 0x54 },
+	{ 0x3C9A, 0x70 },
+	{ 0x3C9C, 0xC1 },
+	{ 0x3C9E, 0xDD },
+	{ 0x3CB0, 0x7A },
+	{ 0x3CB2, 0xBA },
+	{ 0x3CC8, 0xBC },
+	{ 0x3CCA, 0x7C },
+	{ 0x3CD4, 0xEA },
+	{ 0x3CD5, 0x01 },
+	{ 0x3CD6, 0x4A },
+	{ 0x3CD8, 0x00 },
+	{ 0x3CD9, 0x00 },
+	{ 0x3CDA, 0xFF },
+	{ 0x3CDB, 0x03 },
+	{ 0x3CDC, 0x00 },
+	{ 0x3CDD, 0x00 },
+	{ 0x3CDE, 0xFF },
+	{ 0x3CDF, 0x03 },
+	{ 0x3CE4, 0x4C },
+	{ 0x3CE6, 0xEC },
+	{ 0x3CE7, 0x01 },
+	{ 0x3CE8, 0xFF },
+	{ 0x3CE9, 0x03 },
+	{ 0x3CEA, 0x00 },
+	{ 0x3CEB, 0x00 },
+	{ 0x3CEC, 0xFF },
+	{ 0x3CED, 0x03 },
+	{ 0x3CEE, 0x00 },
+	{ 0x3CEF, 0x00 },
+	/* 0x3CF2: Using default value */
+	/* 0x3CF3: Using default value */
+	/* 0x3CF4: Using default value */
+	{ 0x3E28, 0x82 },
+	{ 0x3E2A, 0x80 },
+	{ 0x3E30, 0x85 },
+	{ 0x3E32, 0x7D },
+	{ 0x3E5C, 0xCE },
+	{ 0x3E5E, 0xD3 },
+	{ 0x3E70, 0x53 },
+	{ 0x3E72, 0x58 },
+	{ 0x3E74, 0xC0 },
+	{ 0x3E76, 0xC5 },
+	{ 0x3E78, 0xC0 },
+	{ 0x3E79, 0x01 },
+	{ 0x3E7A, 0xD4 },
+	{ 0x3E7B, 0x01 },
+	{ 0x3EB4, 0x0B },
+	{ 0x3EB5, 0x02 },
+	{ 0x3EB6, 0x4D },
+	/* 0x3EB7: Using default value */
+	{ 0x3EEC, 0xF3 },
+	{ 0x3EEE, 0xE7 },
+	{ 0x3F01, 0x01 },
+	{ 0x3F24, 0x10 },
+	{ 0x3F28, 0x2D },
+	{ 0x3F2A, 0x2D },
+	{ 0x3F2C, 0x2D },
+	{ 0x3F2E, 0x2D },
+	{ 0x3F30, 0x23 },
+	{ 0x3F38, 0x2D },
+	{ 0x3F3A, 0x2D },
+	{ 0x3F3C, 0x2D },
+	{ 0x3F3E, 0x28 },
+	{ 0x3F40, 0x1E },
+	{ 0x3F48, 0x2D },
+	{ 0x3F4A, 0x2D },
+	/* 0x3F4C: Using default value */
+	{ 0x4004, 0xE4 },
+	{ 0x4006, 0xFF },
+	{ 0x4018, 0x69 },
+	{ 0x401A, 0x84 },
+	{ 0x401C, 0xD6 },
+	{ 0x401E, 0xF1 },
+	{ 0x4038, 0xDE },
+	{ 0x403A, 0x00 },
+	{ 0x403B, 0x01 },
+	{ 0x404C, 0x63 },
+	{ 0x404E, 0x85 },
+	{ 0x4050, 0xD0 },
+	{ 0x4052, 0xF2 },
+	{ 0x4108, 0xDD },
+	{ 0x410A, 0xF7 },
+	{ 0x411C, 0x62 },
+	{ 0x411E, 0x7C },
+	{ 0x4120, 0xCF },
+	{ 0x4122, 0xE9 },
+	{ 0x4138, 0xE6 },
+	{ 0x413A, 0xF1 },
+	{ 0x414C, 0x6B },
+	{ 0x414E, 0x76 },
+	{ 0x4150, 0xD8 },
+	{ 0x4152, 0xE3 },
+	{ 0x417E, 0x03 },
+	{ 0x417F, 0x01 },
+	{ 0x4186, 0xE0 },
+	{ 0x4190, 0xF3 },
+	{ 0x4192, 0xF7 },
+	{ 0x419C, 0x78 },
+	{ 0x419E, 0x7C },
+	{ 0x41A0, 0xE5 },
+	{ 0x41A2, 0xE9 },
+	{ 0x41C8, 0xE2 },
+	{ 0x41CA, 0xFD },
+	{ 0x41DC, 0x67 },
+	{ 0x41DE, 0x82 },
+	{ 0x41E0, 0xD4 },
+	{ 0x41E2, 0xEF },
+	{ 0x4200, 0xDE },
+	{ 0x4202, 0xDA },
+	{ 0x4218, 0x63 },
+	{ 0x421A, 0x5F },
+	{ 0x421C, 0xD0 },
+	{ 0x421E, 0xCC },
+	{ 0x425A, 0x82 },
+	{ 0x425C, 0xEF },
+	{ 0x4348, 0xFE },
+	{ 0x4349, 0x06 },
+	{ 0x4352, 0xCE },
+	{ 0x4420, 0x0B },
+	{ 0x4421, 0x02 },
+	{ 0x4422, 0x4D },
+	/* 0x4423: Using default value */
+	{ 0x4426, 0xF5 },
+	{ 0x442A, 0xE7 },
+	{ 0x4432, 0xF5 },
+	{ 0x4436, 0xE7 },
+	{ 0x4466, 0xB4 },
+	{ 0x446E, 0x32 },
+	{ 0x449F, 0x1C },
+	{ 0x44A4, 0x2C },
+	{ 0x44A6, 0x2C },
+	{ 0x44A8, 0x2C },
+	{ 0x44AA, 0x2C },
+	{ 0x44B4, 0x2C },
+	{ 0x44B6, 0x2C },
+	{ 0x44B8, 0x2C },
+	{ 0x44BA, 0x2C },
+	{ 0x44C4, 0x2C },
+	{ 0x44C6, 0x2C },
+	{ 0x44C8, 0x2C },
+	{ 0x4506, 0xF3 },
+	{ 0x450E, 0xE5 },
+	{ 0x4516, 0xF3 },
+	{ 0x4522, 0xE5 },
+	{ 0x4524, 0xF3 },
+	{ 0x452C, 0xE5 },
+	{ 0x453C, 0x22 },
+	{ 0x453D, 0x1B },
+	{ 0x453E, 0x1B },
+	{ 0x453F, 0x15 },
+	{ 0x4540, 0x15 },
+	{ 0x4541, 0x15 },
+	{ 0x4542, 0x15 },
+	{ 0x4543, 0x15 },
+	{ 0x4544, 0x15 },
+	{ 0x4548, 0x00 },
+	{ 0x4549, 0x01 },
+	{ 0x454A, 0x01 },
+	{ 0x454B, 0x06 },
+	{ 0x454C, 0x06 },
+	{ 0x454D, 0x06 },
+	{ 0x454E, 0x06 },
+	{ 0x454F, 0x06 },
+	{ 0x4550, 0x06 },
+	{ 0x4554, 0x55 },
+	{ 0x4555, 0x02 },
+	{ 0x4556, 0x42 },
+	{ 0x4557, 0x05 },
+	{ 0x4558, 0xFD },
+	{ 0x4559, 0x05 },
+	{ 0x455A, 0x94 },
+	{ 0x455B, 0x06 },
+	{ 0x455D, 0x06 },
+	{ 0x455E, 0x49 },
+	{ 0x455F, 0x07 },
+	{ 0x4560, 0x7F },
+	{ 0x4561, 0x07 },
+	{ 0x4562, 0xA5 },
+	{ 0x4564, 0x55 },
+	{ 0x4565, 0x02 },
+	{ 0x4566, 0x42 },
+	{ 0x4567, 0x05 },
+	{ 0x4568, 0xFD },
+	{ 0x4569, 0x05 },
+	{ 0x456A, 0x94 },
+	{ 0x456B, 0x06 },
+	{ 0x456D, 0x06 },
+	{ 0x456E, 0x49 },
+	{ 0x456F, 0x07 },
+	{ 0x4572, 0xA5 },
+	{ 0x460C, 0x7D },
+	{ 0x460E, 0xB1 },
+	{ 0x4614, 0xA8 },
+	{ 0x4616, 0xB2 },
+	{ 0x461C, 0x7E },
+	{ 0x461E, 0xA7 },
+	{ 0x4624, 0xA8 },
+	{ 0x4626, 0xB2 },
+	{ 0x462C, 0x7E },
+	{ 0x462E, 0x8A },
+	{ 0x4630, 0x94 },
+	{ 0x4632, 0xA7 },
+	{ 0x4634, 0xFB },
+	{ 0x4636, 0x2F },
+	{ 0x4638, 0x81 },
+	{ 0x4639, 0x01 },
+	{ 0x463A, 0xB5 },
+	{ 0x463B, 0x01 },
+	{ 0x463C, 0x26 },
+	{ 0x463E, 0x30 },
+	{ 0x4640, 0xAC },
+	{ 0x4641, 0x01 },
+	{ 0x4642, 0xB6 },
+	{ 0x4643, 0x01 },
+	{ 0x4644, 0xFC },
+	{ 0x4646, 0x25 },
+	{ 0x4648, 0x82 },
+	{ 0x4649, 0x01 },
+	{ 0x464A, 0xAB },
+	{ 0x464B, 0x01 },
+	{ 0x464C, 0x26 },
+	{ 0x464E, 0x30 },
+	{ 0x4654, 0xFC },
+	{ 0x4656, 0x08 },
+	{ 0x4658, 0x12 },
+	{ 0x465A, 0x25 },
+	{ 0x4662, 0xFC },
+	{ 0x46A2, 0xFB },
+	{ 0x46D6, 0xF3 },
+	{ 0x46E6, 0x00 },
+	{ 0x46E8, 0xFF },
+	{ 0x46E9, 0x03 },
+	{ 0x46EC, 0x7A },
+	{ 0x46EE, 0xE5 },
+	{ 0x46F4, 0xEE },
+	{ 0x46F6, 0xF2 },
+	{ 0x470C, 0xFF },
+	{ 0x470D, 0x03 },
+	{ 0x470E, 0x00 },
+	{ 0x4714, 0xE0 },
+	{ 0x4716, 0xE4 },
+	{ 0x471E, 0xED },
+	{ 0x472E, 0x00 },
+	{ 0x4730, 0xFF },
+	{ 0x4731, 0x03 },
+	{ 0x4734, 0x7B },
+	{ 0x4736, 0xDF },
+	{ 0x4754, 0x7D },
+	{ 0x4756, 0x8B },
+	{ 0x4758, 0x93 },
+	{ 0x475A, 0xB1 },
+	{ 0x475C, 0xFB },
+	{ 0x475E, 0x09 },
+	{ 0x4760, 0x11 },
+	{ 0x4762, 0x2F },
+	{ 0x4766, 0xCC },
+	{ 0x4776, 0xCB },
+	{ 0x477E, 0x4A },
+	{ 0x478E, 0x49 },
+	{ 0x4794, 0x7C },
+	{ 0x4796, 0x8F },
+	{ 0x4798, 0xB3 },
+	{ 0x4799, 0x00 },
+	{ 0x479A, 0xCC },
+	{ 0x479C, 0xC1 },
+	{ 0x479E, 0xCB },
+	{ 0x47A4, 0x7D },
+	{ 0x47A6, 0x8E },
+	{ 0x47A8, 0xB4 },
+	{ 0x47A9, 0x00 },
+	{ 0x47AA, 0xC0 },
+	{ 0x47AC, 0xFA },
+	{ 0x47AE, 0x0D },
+	{ 0x47B0, 0x31 },
+	{ 0x47B1, 0x01 },
+	{ 0x47B2, 0x4A },
+	{ 0x47B3, 0x01 },
+	{ 0x47B4, 0x3F },
+	{ 0x47B6, 0x49 },
+	{ 0x47BC, 0xFB },
+	{ 0x47BE, 0x0C },
+	{ 0x47C0, 0x32 },
+	{ 0x47C1, 0x01 },
+	{ 0x47C2, 0x3E },
+	{ 0x47C3, 0x01 },
+	{ 0x4E3C, 0x07 },
+};
+
 
 static const struct imx678_reg mode_4k_3dol_all_pixel[] = {
 	/* 0x3000: Using default value (STANDBY) */
@@ -1166,446 +1677,6 @@ static const struct imx678_reg imx678_tpg_en_regs[] = {
 	{ 0x30e4, 0x13 }, //TPG_COLORWIDTH
 };
 
-static const struct imx678_reg mode_1920x1080_3dol_binning_8fps_regs[] = {
-	/* 0x3000: Using default value (STANDBY) */
-	/* 0x3001: Using default value (REGHOLD) */
-	{ 0x3002, 0x01 }, /* XMSTA */
-	{ 0x3014, 0x04 }, /* INCK_SEL[3:0] */
-	{ 0x3015, 0x06 }, /* DATARATE_SEL[3:0] */
-	{ 0x3018, 0x04 }, /* WINMODE[4:0] */  // MANUAL (crop 3856x2180 to 3840x2160)
-	/* 0x3019: Using default value (CFMODE[1:0]) */
-	{ 0x301A, 0x02 }, /* WDMODE[7:0] */
-	{ 0x301B, 0x01 }, /* ADDMODE[1:0] */
-	{ 0x301C, 0x01 }, /* THIN_V_EN[7:0] */
-	/* 0x301E: Using default value (VCMODE[7:0]) */
-	/* 0x3020: Using default value (HREVERSE) */
-	/* 0x3021: Using default value (VREVERSE) */
-	{ 0x3022, 0x00 }, /* ADBIT[1:0] */
-	{ 0x3023, 0x01 }, /* MDBIT */
-	/* 0x3028: Using default value (VMAX[19:0]) */
-	{ 0x3028, 0xca }, /* VMAX[19:0] */
-	{ 0x3029, 0x08 },
-	/* 0x302A: Using default value */
-	{ 0x302C, 0x28 }, /* HMAX[15:0] */
-	{ 0x302D, 0x05 },
-	/* 0x3030: Using default value (FDG_SEL0[1:0]) */
-	/* 0x3031: Using default value (FDG_SEL1[1:0]) */
-	/* 0x3032: Using default value (FDG_SEL2[1:0]) */
-	/* 0x303C: Using default value (PIX_HST[12:0]) */
-	/* 0x303D: Using default value */
-	{ 0x303E, 0x00 }, /* PIX_HWIDTH[12:0] */  // MANUAL (crop 3856 to 3840)
-	{ 0x303F, 0x0F }, // MANUAL (crop 3856 to 3840)
-	{ 0x3040, 0x03 }, /* LANEMODE[2:0] */
-	/* 0x3042: Using default value (XSIZE_OVERLAP[10:0]) */
-	/* 0x3043: Using default value */
-	/* 0x3044: Using default value (PIX_VST[11:0]) */
-	/* 0x3045: Using default value */
-	{ 0x3046, 0x70 }, /* PIX_VWIDTH[11:0] */  // MANUAL (crop 2180 to 2160)
-	{ 0x3047, 0x08 }, // MANUAL (crop 2180 to 2160)
-	{ 0x3050, 0x18 }, /* SHR0[19:0] */
-	{ 0x3051, 0x15 },
-	/* 0x3052: Using default value */
-	{ 0x3054, 0x07 }, /* SHR1[19:0] */
-	/* 0x3055: Using default value */
-	/* 0x3056: Using default value */
-	{ 0x3058, 0x4A }, /* SHR2[19:0] */
-	{ 0x3059, 0x00 },
-	/* 0x305A: Using default value */
-	{ 0x3060, 0x43 }, /* RHS1[19:0] */
-	{ 0x3061, 0x00 },
-	/* 0x3062: Using default value */
-	{ 0x3064, 0x56 }, /* RHS2[19:0] */
-	{ 0x3065, 0x00 },
-	/* 0x3066: Using default value */
-	/* 0x3069: Using default value (CHDR_GAIN_EN[7:0]) */
-	/* 0x306B: Using default value */
-	/* 0x3070: Using default value (GAIN[10:0]) */
-	/* 0x3071: Using default value */
-	/* 0x3072: Using default value (GAIN_1[10:0]) */
-	/* 0x3073: Using default value */
-	/* 0x3074: Using default value (GAIN_2[10:0]) */
-	/* 0x3075: Using default value */
-	/* 0x3081: Using default value (EXP_GAIN[7:0]) */
-	/* 0x308C: Using default value (CHDR_DGAIN0_HG[15:0]) */
-	/* 0x308D: Using default value */
-	/* 0x3094: Using default value (CHDR_AGAIN0_LG[10:0]) */
-	/* 0x3095: Using default value */
-	/* 0x309C: Using default value (CHDR_AGAIN0_HG[10:0]) */
-	/* 0x309D: Using default value */
-	/* 0x30A4: Using default value (XVSOUTSEL[1:0]) */
-	{ 0x30A6, 0x00 }, /* XVS_DRV[1:0] */
-	/* 0x30CC: Using default value */
-	/* 0x30CD: Using default value */
-	/* 0x30DC: Using default value (BLKLEVEL[11:0]) */
-	/* 0x30DD: Using default value */
-	/* 0x3400: Using default value (GAIN_PGC_FIDMD) */
-	{ 0x3460, 0x22 },
-	{ 0x355A, 0x64 },
-	{ 0x3A02, 0x7A },
-	{ 0x3A10, 0xEC },
-	{ 0x3A12, 0x71 },
-	{ 0x3A14, 0xDE },
-	{ 0x3A20, 0x2B },
-	{ 0x3A24, 0x22 },
-	{ 0x3A25, 0x25 },
-	{ 0x3A26, 0x2A },
-	{ 0x3A27, 0x2C },
-	{ 0x3A28, 0x39 },
-	{ 0x3A29, 0x38 },
-	{ 0x3A30, 0x04 },
-	{ 0x3A31, 0x04 },
-	{ 0x3A32, 0x03 },
-	{ 0x3A33, 0x03 },
-	{ 0x3A34, 0x09 },
-	{ 0x3A35, 0x06 },
-	{ 0x3A38, 0xCD },
-	{ 0x3A3A, 0x4C },
-	{ 0x3A3C, 0xB9 },
-	{ 0x3A3E, 0x30 },
-	{ 0x3A40, 0x2C },
-	{ 0x3A42, 0x39 },
-	{ 0x3A4E, 0x00 },
-	{ 0x3A52, 0x00 },
-	{ 0x3A56, 0x00 },
-	{ 0x3A5A, 0x00 },
-	{ 0x3A5E, 0x00 },
-	{ 0x3A62, 0x00 },
-	/* 0x3A64: Using default value */
-	{ 0x3A6E, 0xA0 },
-	{ 0x3A70, 0x50 },
-	{ 0x3A8C, 0x04 },
-	{ 0x3A8D, 0x03 },
-	{ 0x3A8E, 0x09 },
-	{ 0x3A90, 0x38 },
-	{ 0x3A91, 0x42 },
-	{ 0x3A92, 0x3C },
-	{ 0x3B0E, 0xF3 },
-	{ 0x3B12, 0xE5 },
-	{ 0x3B27, 0xC0 },
-	{ 0x3B2E, 0xEF },
-	{ 0x3B30, 0x6A },
-	{ 0x3B32, 0xF6 },
-	{ 0x3B36, 0xE1 },
-	{ 0x3B3A, 0xE8 },
-	{ 0x3B5A, 0x17 },
-	{ 0x3B5E, 0xEF },
-	{ 0x3B60, 0x6A },
-	{ 0x3B62, 0xF6 },
-	{ 0x3B66, 0xE1 },
-	{ 0x3B6A, 0xE8 },
-	{ 0x3B88, 0xEC },
-	{ 0x3B8A, 0xED },
-	{ 0x3B94, 0x71 },
-	{ 0x3B96, 0x72 },
-	{ 0x3B98, 0xDE },
-	{ 0x3B9A, 0xDF },
-	{ 0x3C0F, 0x06 },
-	{ 0x3C10, 0x06 },
-	{ 0x3C11, 0x06 },
-	{ 0x3C12, 0x06 },
-	{ 0x3C13, 0x06 },
-	{ 0x3C18, 0x20 },
-	/* 0x3C37: Using default value */
-	{ 0x3C3A, 0x7A },
-	{ 0x3C40, 0xF4 },
-	{ 0x3C48, 0xE6 },
-	{ 0x3C54, 0xCE },
-	{ 0x3C56, 0xD0 },
-	{ 0x3C6C, 0x53 },
-	{ 0x3C6E, 0x55 },
-	{ 0x3C70, 0xC0 },
-	{ 0x3C72, 0xC2 },
-	{ 0x3C7E, 0xCE },
-	{ 0x3C8C, 0xCF },
-	{ 0x3C8E, 0xEB },
-	{ 0x3C98, 0x54 },
-	{ 0x3C9A, 0x70 },
-	{ 0x3C9C, 0xC1 },
-	{ 0x3C9E, 0xDD },
-	{ 0x3CB0, 0x7A },
-	{ 0x3CB2, 0xBA },
-	{ 0x3CC8, 0xBC },
-	{ 0x3CCA, 0x7C },
-	{ 0x3CD4, 0xEA },
-	{ 0x3CD5, 0x01 },
-	{ 0x3CD6, 0x4A },
-	{ 0x3CD8, 0x00 },
-	{ 0x3CD9, 0x00 },
-	{ 0x3CDA, 0xFF },
-	{ 0x3CDB, 0x03 },
-	{ 0x3CDC, 0x00 },
-	{ 0x3CDD, 0x00 },
-	{ 0x3CDE, 0xFF },
-	{ 0x3CDF, 0x03 },
-	{ 0x3CE4, 0x4C },
-	{ 0x3CE6, 0xEC },
-	{ 0x3CE7, 0x01 },
-	{ 0x3CE8, 0xFF },
-	{ 0x3CE9, 0x03 },
-	{ 0x3CEA, 0x00 },
-	{ 0x3CEB, 0x00 },
-	{ 0x3CEC, 0xFF },
-	{ 0x3CED, 0x03 },
-	{ 0x3CEE, 0x00 },
-	{ 0x3CEF, 0x00 },
-	/* 0x3CF2: Using default value */
-	/* 0x3CF3: Using default value */
-	/* 0x3CF4: Using default value */
-	{ 0x3E28, 0x82 },
-	{ 0x3E2A, 0x80 },
-	{ 0x3E30, 0x85 },
-	{ 0x3E32, 0x7D },
-	{ 0x3E5C, 0xCE },
-	{ 0x3E5E, 0xD3 },
-	{ 0x3E70, 0x53 },
-	{ 0x3E72, 0x58 },
-	{ 0x3E74, 0xC0 },
-	{ 0x3E76, 0xC5 },
-	{ 0x3E78, 0xC0 },
-	{ 0x3E79, 0x01 },
-	{ 0x3E7A, 0xD4 },
-	{ 0x3E7B, 0x01 },
-	{ 0x3EB4, 0x0B },
-	{ 0x3EB5, 0x02 },
-	{ 0x3EB6, 0x4D },
-	/* 0x3EB7: Using default value */
-	{ 0x3EEC, 0xF3 },
-	{ 0x3EEE, 0xE7 },
-	{ 0x3F01, 0x01 },
-	{ 0x3F24, 0x10 },
-	{ 0x3F28, 0x2D },
-	{ 0x3F2A, 0x2D },
-	{ 0x3F2C, 0x2D },
-	{ 0x3F2E, 0x2D },
-	{ 0x3F30, 0x23 },
-	{ 0x3F38, 0x2D },
-	{ 0x3F3A, 0x2D },
-	{ 0x3F3C, 0x2D },
-	{ 0x3F3E, 0x28 },
-	{ 0x3F40, 0x1E },
-	{ 0x3F48, 0x2D },
-	{ 0x3F4A, 0x2D },
-	/* 0x3F4C: Using default value */
-	{ 0x4004, 0xE4 },
-	{ 0x4006, 0xFF },
-	{ 0x4018, 0x69 },
-	{ 0x401A, 0x84 },
-	{ 0x401C, 0xD6 },
-	{ 0x401E, 0xF1 },
-	{ 0x4038, 0xDE },
-	{ 0x403A, 0x00 },
-	{ 0x403B, 0x01 },
-	{ 0x404C, 0x63 },
-	{ 0x404E, 0x85 },
-	{ 0x4050, 0xD0 },
-	{ 0x4052, 0xF2 },
-	{ 0x4108, 0xDD },
-	{ 0x410A, 0xF7 },
-	{ 0x411C, 0x62 },
-	{ 0x411E, 0x7C },
-	{ 0x4120, 0xCF },
-	{ 0x4122, 0xE9 },
-	{ 0x4138, 0xE6 },
-	{ 0x413A, 0xF1 },
-	{ 0x414C, 0x6B },
-	{ 0x414E, 0x76 },
-	{ 0x4150, 0xD8 },
-	{ 0x4152, 0xE3 },
-	{ 0x417E, 0x03 },
-	{ 0x417F, 0x01 },
-	{ 0x4186, 0xE0 },
-	{ 0x4190, 0xF3 },
-	{ 0x4192, 0xF7 },
-	{ 0x419C, 0x78 },
-	{ 0x419E, 0x7C },
-	{ 0x41A0, 0xE5 },
-	{ 0x41A2, 0xE9 },
-	{ 0x41C8, 0xE2 },
-	{ 0x41CA, 0xFD },
-	{ 0x41DC, 0x67 },
-	{ 0x41DE, 0x82 },
-	{ 0x41E0, 0xD4 },
-	{ 0x41E2, 0xEF },
-	{ 0x4200, 0xDE },
-	{ 0x4202, 0xDA },
-	{ 0x4218, 0x63 },
-	{ 0x421A, 0x5F },
-	{ 0x421C, 0xD0 },
-	{ 0x421E, 0xCC },
-	{ 0x425A, 0x82 },
-	{ 0x425C, 0xEF },
-	{ 0x4348, 0xFE },
-	{ 0x4349, 0x06 },
-	{ 0x4352, 0xCE },
-	{ 0x4420, 0x0B },
-	{ 0x4421, 0x02 },
-	{ 0x4422, 0x4D },
-	/* 0x4423: Using default value */
-	{ 0x4426, 0xF5 },
-	{ 0x442A, 0xE7 },
-	{ 0x4432, 0xF5 },
-	{ 0x4436, 0xE7 },
-	{ 0x4466, 0xB4 },
-	{ 0x446E, 0x32 },
-	{ 0x449F, 0x1C },
-	{ 0x44A4, 0x2C },
-	{ 0x44A6, 0x2C },
-	{ 0x44A8, 0x2C },
-	{ 0x44AA, 0x2C },
-	{ 0x44B4, 0x2C },
-	{ 0x44B6, 0x2C },
-	{ 0x44B8, 0x2C },
-	{ 0x44BA, 0x2C },
-	{ 0x44C4, 0x2C },
-	{ 0x44C6, 0x2C },
-	{ 0x44C8, 0x2C },
-	{ 0x4506, 0xF3 },
-	{ 0x450E, 0xE5 },
-	{ 0x4516, 0xF3 },
-	{ 0x4522, 0xE5 },
-	{ 0x4524, 0xF3 },
-	{ 0x452C, 0xE5 },
-	{ 0x453C, 0x22 },
-	{ 0x453D, 0x1B },
-	{ 0x453E, 0x1B },
-	{ 0x453F, 0x15 },
-	{ 0x4540, 0x15 },
-	{ 0x4541, 0x15 },
-	{ 0x4542, 0x15 },
-	{ 0x4543, 0x15 },
-	{ 0x4544, 0x15 },
-	{ 0x4548, 0x00 },
-	{ 0x4549, 0x01 },
-	{ 0x454A, 0x01 },
-	{ 0x454B, 0x06 },
-	{ 0x454C, 0x06 },
-	{ 0x454D, 0x06 },
-	{ 0x454E, 0x06 },
-	{ 0x454F, 0x06 },
-	{ 0x4550, 0x06 },
-	{ 0x4554, 0x55 },
-	{ 0x4555, 0x02 },
-	{ 0x4556, 0x42 },
-	{ 0x4557, 0x05 },
-	{ 0x4558, 0xFD },
-	{ 0x4559, 0x05 },
-	{ 0x455A, 0x94 },
-	{ 0x455B, 0x06 },
-	{ 0x455D, 0x06 },
-	{ 0x455E, 0x49 },
-	{ 0x455F, 0x07 },
-	{ 0x4560, 0x7F },
-	{ 0x4561, 0x07 },
-	{ 0x4562, 0xA5 },
-	{ 0x4564, 0x55 },
-	{ 0x4565, 0x02 },
-	{ 0x4566, 0x42 },
-	{ 0x4567, 0x05 },
-	{ 0x4568, 0xFD },
-	{ 0x4569, 0x05 },
-	{ 0x456A, 0x94 },
-	{ 0x456B, 0x06 },
-	{ 0x456D, 0x06 },
-	{ 0x456E, 0x49 },
-	{ 0x456F, 0x07 },
-	{ 0x4572, 0xA5 },
-	{ 0x460C, 0x7D },
-	{ 0x460E, 0xB1 },
-	{ 0x4614, 0xA8 },
-	{ 0x4616, 0xB2 },
-	{ 0x461C, 0x7E },
-	{ 0x461E, 0xA7 },
-	{ 0x4624, 0xA8 },
-	{ 0x4626, 0xB2 },
-	{ 0x462C, 0x7E },
-	{ 0x462E, 0x8A },
-	{ 0x4630, 0x94 },
-	{ 0x4632, 0xA7 },
-	{ 0x4634, 0xFB },
-	{ 0x4636, 0x2F },
-	{ 0x4638, 0x81 },
-	{ 0x4639, 0x01 },
-	{ 0x463A, 0xB5 },
-	{ 0x463B, 0x01 },
-	{ 0x463C, 0x26 },
-	{ 0x463E, 0x30 },
-	{ 0x4640, 0xAC },
-	{ 0x4641, 0x01 },
-	{ 0x4642, 0xB6 },
-	{ 0x4643, 0x01 },
-	{ 0x4644, 0xFC },
-	{ 0x4646, 0x25 },
-	{ 0x4648, 0x82 },
-	{ 0x4649, 0x01 },
-	{ 0x464A, 0xAB },
-	{ 0x464B, 0x01 },
-	{ 0x464C, 0x26 },
-	{ 0x464E, 0x30 },
-	{ 0x4654, 0xFC },
-	{ 0x4656, 0x08 },
-	{ 0x4658, 0x12 },
-	{ 0x465A, 0x25 },
-	{ 0x4662, 0xFC },
-	{ 0x46A2, 0xFB },
-	{ 0x46D6, 0xF3 },
-	{ 0x46E6, 0x00 },
-	{ 0x46E8, 0xFF },
-	{ 0x46E9, 0x03 },
-	{ 0x46EC, 0x7A },
-	{ 0x46EE, 0xE5 },
-	{ 0x46F4, 0xEE },
-	{ 0x46F6, 0xF2 },
-	{ 0x470C, 0xFF },
-	{ 0x470D, 0x03 },
-	{ 0x470E, 0x00 },
-	{ 0x4714, 0xE0 },
-	{ 0x4716, 0xE4 },
-	{ 0x471E, 0xED },
-	{ 0x472E, 0x00 },
-	{ 0x4730, 0xFF },
-	{ 0x4731, 0x03 },
-	{ 0x4734, 0x7B },
-	{ 0x4736, 0xDF },
-	{ 0x4754, 0x7D },
-	{ 0x4756, 0x8B },
-	{ 0x4758, 0x93 },
-	{ 0x475A, 0xB1 },
-	{ 0x475C, 0xFB },
-	{ 0x475E, 0x09 },
-	{ 0x4760, 0x11 },
-	{ 0x4762, 0x2F },
-	{ 0x4766, 0xCC },
-	{ 0x4776, 0xCB },
-	{ 0x477E, 0x4A },
-	{ 0x478E, 0x49 },
-	{ 0x4794, 0x7C },
-	{ 0x4796, 0x8F },
-	{ 0x4798, 0xB3 },
-	{ 0x4799, 0x00 },
-	{ 0x479A, 0xCC },
-	{ 0x479C, 0xC1 },
-	{ 0x479E, 0xCB },
-	{ 0x47A4, 0x7D },
-	{ 0x47A6, 0x8E },
-	{ 0x47A8, 0xB4 },
-	{ 0x47A9, 0x00 },
-	{ 0x47AA, 0xC0 },
-	{ 0x47AC, 0xFA },
-	{ 0x47AE, 0x0D },
-	{ 0x47B0, 0x31 },
-	{ 0x47B1, 0x01 },
-	{ 0x47B2, 0x4A },
-	{ 0x47B3, 0x01 },
-	{ 0x47B4, 0x3F },
-	{ 0x47B6, 0x49 },
-	{ 0x47BC, 0xFB },
-	{ 0x47BE, 0x0C },
-	{ 0x47C0, 0x32 },
-	{ 0x47C1, 0x01 },
-	{ 0x47C2, 0x3E },
-	{ 0x47C3, 0x01 },
-	{ 0x4E3C, 0x07 }
-};
 
 static const struct imx678_reg mode_1920x1080_3dol_binning_20fps_regs[] = {
 	{ 0x3002, 0x01 }, /* XMSTA */
@@ -2002,6 +2073,8 @@ static const struct imx678_mode supported_sdr_modes[] = {
 	.vblank = 2340,
 	.vblank_min = 90,
 	.vblank_max = IMX678_MAX_LPFR_4K,
+	.rhs1 = 0x0,
+	.rhs2 = 0x0,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_1X12,
@@ -2021,6 +2094,8 @@ static const struct imx678_mode supported_sdr_modes[] = {
 	.vblank = 90,
 	.vblank_min = 90,
 	.vblank_max = IMX678_MAX_LPFR_4K,
+	.rhs1 = 0x0,
+	.rhs2 = 0x0,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_1X12,
@@ -2040,6 +2115,8 @@ static const struct imx678_mode supported_sdr_modes[] = {
 	.vblank = 3420,
 	.vblank_min = 90,
 	.vblank_max = 132840,
+	.rhs1 = 0x0,
+	.rhs2 = 0x0,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_1X12,
@@ -2056,24 +2133,48 @@ static const struct imx678_mode supported_sdr_modes[] = {
 
 static const struct imx678_mode supported_hdr_modes[] = {
 	{
-	.width = 1920,
-	.height = 1080,
-	.hblank = 1320,
-	.vblank = 1170,
-	.vblank_min = 90,
-	.vblank_max = 132840,
-	.pclk = 594000000,
-	.link_freq_idx = 0,
-	.code = MEDIA_BUS_FMT_SRGGB12_3X12,
-	.reg_list = {
-		.num_of_regs = ARRAY_SIZE(mode_1920x1080_3dol_binning_8fps_regs),
-		.regs = mode_1920x1080_3dol_binning_8fps_regs,
-	},
-	.frame_interval = {
-		.denominator = 8,
-		.numerator = 1,
-	},
-	},
+    .width = 3840,
+    .height = 2160,
+    .hblank = 1320,
+    .vblank = 90,
+    .vblank_min = 90,
+    .vblank_max = 132840,
+	.rhs1 = 0x40,
+	.rhs2 = 0x53,
+    .pclk = 594000000,
+    .link_freq_idx = 0,
+    .code = MEDIA_BUS_FMT_SRGGB12_3X12,
+    .reg_list = {
+        .num_of_regs = ARRAY_SIZE(mode_4k_3dol_all_pixel),
+        .regs = mode_4k_3dol_all_pixel,
+    },
+    .frame_interval = {
+        .denominator = 8,
+        .numerator = 1,
+    },
+    },
+	{
+    .width = 3840,
+    .height = 2160,
+    .hblank = 550, /*change in registers*/
+    .vblank = 90,  /*  */
+    .vblank_min = 90,
+    .vblank_max = 132840,
+	.rhs1 = 0x8e, /* change in registers */
+	.rhs2 = 0xa7, /* change in registers */
+    .pclk = 594000000,
+    .link_freq_idx = 0,
+    .code = MEDIA_BUS_FMT_SRGGB12_3X12,
+    .reg_list = {
+        .num_of_regs = ARRAY_SIZE(mode_4k_3dol_20fps_all_pixel),
+        .regs = mode_4k_3dol_20fps_all_pixel,
+    },
+    .frame_interval = {
+        .denominator = 20,
+        .numerator = 1,
+    },
+    },
+
 	{
 	.width = 1920,
 	.height = 1080,
@@ -2081,6 +2182,8 @@ static const struct imx678_mode supported_hdr_modes[] = {
 	.vblank = 1170,
 	.vblank_min = 90,
 	.vblank_max = 132840,
+	.rhs1 = 0x91,
+	.rhs2 = 0xAA,
 	.pclk = 594000000,
 	.link_freq_idx = 0,
 	.code = MEDIA_BUS_FMT_SRGGB12_3X12,
@@ -2093,27 +2196,60 @@ static const struct imx678_mode supported_hdr_modes[] = {
 		.numerator = 1,
 	},
 	},
-	{
-    .width = 3840,
-    .height = 2160,
-    .hblank = 1320,
-    .vblank = 91,
-    .vblank_min = 90,
-    .vblank_max = 132840,
-    .pclk = 594000000,
-    .link_freq_idx = 0,
-    .code = MEDIA_BUS_FMT_SRGGB12_3X12,
-    .reg_list = {
-        .num_of_regs = ARRAY_SIZE(mode_4k_3dol_all_pixel),
-        .regs = mode_4k_3dol_all_pixel,
-    },
-    .frame_interval = {
-        .denominator = 30,
-        .numerator = 1,
-    },
-    },
-
 };
+
+struct v4l2_ctrl_config imx678_3dol_ctrls[] = {
+	{
+		.ops = &imx678_ctrl_ops,
+		.id = IMX678_CID_ANALOGUE_GAIN_SHORT,
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_UPDATE,
+		.name = "analogue_gain_short",
+		.step = IMX678_AGAIN_STEP,
+		.min = IMX678_AGAIN_MIN,
+		.max = IMX678_AGAIN_MAX,
+		.def = IMX678_AGAIN_DEFAULT,
+	},
+	{
+		.ops = &imx678_ctrl_ops,
+		.id = IMX678_CID_ANALOGUE_GAIN_VERY_SHORT,
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_UPDATE,
+		.name = "analogue_gain_very_short",
+		.step = IMX678_AGAIN_STEP,
+		.min = IMX678_AGAIN_MIN,
+		.max = IMX678_AGAIN_MAX,
+		.def = IMX678_AGAIN_DEFAULT,
+	},
+	{
+		.ops = &imx678_ctrl_ops,
+		.id = IMX678_CID_EXPOSURE_SHORT,
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_UPDATE,
+		.name = "exposure_short",
+		.step = IMX678_EXPOSURE_SHORT_STEP,
+	},
+	{
+		.ops = &imx678_ctrl_ops,
+		.id = IMX678_CID_EXPOSURE_VERY_SHORT,
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_UPDATE,
+		.name = "exposure_very_short",
+		.step = IMX678_EXPOSURE_VERY_SHORT_STEP,
+	},
+};
+
+static int get_3dol_ctrl_index_by_name(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(imx678_3dol_ctrls); i++) {
+		if (!strcmp(imx678_3dol_ctrls[i].name, name))
+			return i;
+	}
+
+	return -EINVAL;
+}
 
 /**
  * to_imx678() - imv678 V4L2 sub-device to imx678 device.
@@ -2222,6 +2358,67 @@ static int imx678_write_regs(struct imx678 *imx678,
 	return 0;
 }
 
+typedef struct ExposureLimits_t {
+
+    u32 lpfr;
+	u32 min_lpfr;
+	u32 max_lpfr;
+	u32 lef_reg;
+    u32 shr0_min;
+    u32 shr0_max;
+    u32 exp_lef_min;
+    u32 exp_lef_max;
+    u32 exp_lef_default;
+
+    u32 sef1_reg;
+    u32 shr1_min;
+    u32 shr1_max;
+    u32 exp_sef1_min;
+    u32 exp_sef1_max;
+    u32 exp_sef1_default;
+
+    u32 sef2_reg;
+    u32 shr2_min;
+    u32 shr2_max;
+    u32 exp_sef2_min;
+    u32 exp_sef2_max;
+    u32 exp_sef2_default;
+} * ExposureLimits;
+
+void calculate_exposure_limits(struct imx678* imx678, ExposureLimits limits) {
+	const int hdr_multiple = imx678->hdr_enabled ? 3 : 1;
+	const int rhs1 = imx678->cur_mode->rhs1 > 0 ? imx678->cur_mode->rhs1 : IMX678_DEFAULT_RHS1;
+	const int rhs2 = imx678->cur_mode->rhs2 > 0 ? imx678->cur_mode->rhs2 : IMX678_DEFAULT_RHS2;
+	u32 shr0, shr1, shr2;
+	limits->lpfr = hdr_multiple * (imx678->vblank + imx678->cur_mode->height);
+	limits->min_lpfr = hdr_multiple * (imx678->cur_mode->vblank_min + imx678->cur_mode->height);
+	limits->max_lpfr = hdr_multiple * (imx678->cur_mode->vblank_max + imx678->cur_mode->height);
+
+	limits->lef_reg = IMX678_REG_SHUTTER;
+	limits->shr0_min = imx678->hdr_enabled ? imx678->cur_mode->rhs2 + IMX678_SHR0_RHS2_GAP : IMX678_SHR0_FSC_GAP;
+	limits->shr0_max = NON_NEGATIVE(limits->max_lpfr - IMX678_SHR0_FSC_GAP);
+	limits->exp_lef_min = IMX678_SHR0_FSC_GAP;
+	limits->exp_lef_max = NON_NEGATIVE(limits->max_lpfr - limits->shr0_min);
+	shr0 = _get_mode_reg_val_by_address(&imx678->cur_mode->reg_list, limits->lef_reg, 3);
+	limits->exp_lef_default = MAX(limits->exp_lef_min, NON_NEGATIVE((int)limits->lpfr - (int)shr0));
+
+	limits->sef1_reg = IMX678_REG_SHUTTER_SHORT;
+	limits->shr1_min = IMX678_SHR1_MIN_GAP;
+	limits->shr1_max = NON_NEGATIVE(rhs1 - IMX678_SHR1_RHS1_GAP);
+	limits->exp_sef1_min = NON_NEGATIVE(rhs1 - limits->shr1_max);
+	limits->exp_sef1_max = NON_NEGATIVE(rhs1 - limits->shr1_min);
+	shr1 = MAX(limits->shr1_min, _get_mode_reg_val_by_address(&imx678->cur_mode->reg_list, limits->sef1_reg, 3));
+	limits->exp_sef1_default = MAX(limits->exp_sef1_min, NON_NEGATIVE((int)rhs1 - (int)shr1));
+
+	limits->sef2_reg = IMX678_REG_SHUTTER_VERY_SHORT;
+	limits->shr2_min = rhs1 + IMX678_SHR2_RHS1_GAP;
+	limits->shr2_max = NON_NEGATIVE(rhs2 - IMX678_SHR2_RHS2_GAP);
+	limits->exp_sef2_min = NON_NEGATIVE(rhs2 - limits->shr2_max);
+	limits->exp_sef2_max = NON_NEGATIVE(rhs2 - limits->shr2_min);
+	shr2 = MAX(limits->shr2_min, _get_mode_reg_val_by_address(&imx678->cur_mode->reg_list, limits->sef2_reg, 3));
+	limits->exp_sef2_default = MAX(limits->exp_sef2_min, NON_NEGATIVE((int)rhs2 - (int)shr2));
+}
+
 /**
  * imx678_update_controls() - Update control ranges based on streaming mode
  * @imx678: pointer to imx678 device
@@ -2247,44 +2444,97 @@ static int imx678_update_controls(struct imx678* imx678,
 		mode->vblank_max, 1, mode->vblank);
 }
 */
+
+/**
+ * imx678_update_exp_vblank_controls() - Update control ranges based on streaming mode
+ * @imx678: pointer to imx678 device
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int imx678_update_exp_vblank_controls(struct imx678* imx678)
+{
+	struct ExposureLimits_t limits;
+	int ret;
+
+	memset(&limits, 0, sizeof(struct ExposureLimits_t));
+	calculate_exposure_limits(imx678, &limits);
+
+	ret = __v4l2_ctrl_modify_range(imx678->lef.exp_ctrl, limits.exp_lef_min, 
+		limits.exp_lef_max, IMX678_EXPOSURE_STEP, limits.exp_lef_default);
+	if (ret)
+		return ret;
+
+	ret = __v4l2_ctrl_modify_range(imx678->sef1.exp_ctrl, limits.exp_sef1_min, 
+		limits.exp_sef1_max, IMX678_EXPOSURE_SHORT_STEP, limits.exp_sef1_default);
+	if (ret)
+		return ret;
+
+	ret = __v4l2_ctrl_modify_range(imx678->sef2.exp_ctrl, limits.exp_sef2_min, 
+		limits.exp_sef2_max, IMX678_EXPOSURE_VERY_SHORT_STEP, limits.exp_sef2_default);
+	if (ret)
+		return ret;
+	return __v4l2_ctrl_s_ctrl(imx678->vblank_ctrl, imx678->vblank);
+}
+
 /**
  * imx678_update_exp_gain() - Set updated exposure and gain
  * @imx678: pointer to imx678 device
  * @exposure: updated exposure value
  * @gain: updated analog gain value
+ * @exposure_type: exposure type (0: LEF, 1: SEF1, 2: SEF2)
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int imx678_update_exp_gain(struct imx678 *imx678, u32 exposure, u32 gain)
+static int imx678_update_exp_gain(struct imx678 *imx678, u32 exposure, u32 gain, ExposureType exposure_type)
 {
 	u32 lpfr, shutter;
 	int ret;
+	int hdr_multiple = imx678->hdr_enabled ? 3 : 1;
+	int gap;
 
-	if(imx678->vblank + imx678->cur_mode->height - IMX678_EXPOSURE_OFFSET <= exposure)
-		imx678->vblank = exposure - imx678->cur_mode->height + IMX678_EXPOSURE_OFFSET;
-	else
-		imx678->vblank = imx678->cur_mode->vblank;
+	switch (exposure_type) {
+		case (LEF): {
+			gap = imx678->hdr_enabled ? imx678->cur_mode->rhs2 + IMX678_SHR0_RHS2_GAP : IMX678_SHR0_FSC_GAP;
 
-	lpfr = imx678->vblank + imx678->cur_mode->height;
-	lpfr += lpfr % 2; // LPFR must be even
-	shutter = lpfr - exposure;
+			// If the vblank is too small to fit the requested exposure, increase vblank
+			if (exposure > hdr_multiple * (imx678->vblank + imx678->cur_mode->height) - gap) {
+				imx678->vblank = exposure - hdr_multiple * (imx678->cur_mode->height) + gap;
+				__v4l2_ctrl_s_ctrl(imx678->vblank_ctrl, imx678->vblank);
+			}
 
-	dev_dbg(imx678->dev, "Set long exp %u analog gain %u sh0 %u lpfr %u",
-		 exposure, gain, shutter, lpfr);
+			lpfr = imx678->vblank + imx678->cur_mode->height;
+			lpfr += lpfr % 2; // LPFR must be even
+			shutter = NON_NEGATIVE(hdr_multiple * (int)lpfr - (int)exposure);
+			break;
+		}
+		case (SEF1): {
+			shutter = NON_NEGATIVE((int)imx678->cur_mode->rhs1 - (int)exposure);
+			break;
+		}
+		case (SEF2): {
+			shutter = NON_NEGATIVE((int)imx678->cur_mode->rhs2 - (int)exposure);
+			break;
+		}
+	}
+
+	dev_dbg(imx678->dev, "Set long exp %u analog gain %u sh%d %u lpfr %u",
+		 exposure, gain, exposure_type, shutter, lpfr);
 
 	ret = imx678_write_reg(imx678, IMX678_REG_HOLD, 1, 1);
 	if (ret)
 		return ret;
 
-	ret = imx678_write_reg(imx678, IMX678_REG_LPFR, 3, lpfr);
+	if (exposure_type == LEF) {
+		ret = imx678_write_reg(imx678, IMX678_REG_LPFR, 3, lpfr);
+		if (ret)
+			goto error_release_group_hold;
+	}
+
+	ret = imx678_write_reg(imx678, imx678_reg_shutter[exposure_type], 3, shutter);
 	if (ret)
 		goto error_release_group_hold;
 
-	ret = imx678_write_reg(imx678, IMX678_REG_SHUTTER, 3, shutter);
-	if (ret)
-		goto error_release_group_hold;
-
-	ret = imx678_write_reg(imx678, IMX678_REG_AGAIN, 1, gain);
+	ret = imx678_write_reg(imx678, imx678_reg_again[exposure_type], 2, gain);
 
 error_release_group_hold:
 	imx678_write_reg(imx678, IMX678_REG_HOLD, 1, 0);
@@ -2335,23 +2585,22 @@ static int imx678_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct imx678 *imx678 =
 		container_of(ctrl->handler, struct imx678, ctrl_handler);
-	u32 analog_gain;
-	u32 exposure;
+	u32 analog_gain, exposure, lpfr, max_lpfr;
+	int hdr_multiple = imx678->hdr_enabled ? 3 : 1;
 	int ret;
 
 	switch (ctrl->id) {
 	case V4L2_CID_VBLANK:
 		imx678->vblank = imx678->vblank_ctrl->val;
+		max_lpfr = (imx678->cur_mode->vblank_max + imx678->cur_mode->height) * hdr_multiple;
+		lpfr = (imx678->vblank + imx678->cur_mode->height) * hdr_multiple;
 
 		dev_dbg(imx678->dev, "Received vblank %u, new lpfr %u",
-			imx678->vblank,
-			imx678->vblank + imx678->cur_mode->height);
-
+			imx678->vblank, lpfr);
 		ret = __v4l2_ctrl_modify_range(
-			imx678->exp_ctrl, IMX678_EXPOSURE_MIN,
-			imx678->cur_mode->vblank_max + imx678->cur_mode->height -
-				IMX678_EXPOSURE_OFFSET,
-			1, IMX678_EXPOSURE_DEFAULT);
+            imx678->lef.exp_ctrl, IMX678_SHR0_FSC_GAP,
+            max_lpfr - imx678->cur_mode->rhs2 - IMX678_SHR0_RHS2_GAP,
+            IMX678_EXPOSURE_STEP, lpfr - imx678->cur_mode->rhs2 - IMX678_SHR0_RHS2_GAP);
 		break;
 	case V4L2_CID_EXPOSURE:
 
@@ -2360,12 +2609,50 @@ static int imx678_set_ctrl(struct v4l2_ctrl *ctrl)
 			return 0;
 
 		exposure = ctrl->val;
-		analog_gain = imx678->again_ctrl->val;
+		analog_gain = imx678->lef.again_ctrl->val;
 
 		dev_dbg(imx678->dev, "Received exp %u analog gain %u", exposure,
 			analog_gain);
 
-		ret = imx678_update_exp_gain(imx678, exposure, analog_gain);
+		ret = imx678_update_exp_gain(imx678, exposure, analog_gain, LEF);
+
+		pm_runtime_put(imx678->dev);
+
+		break;
+	case IMX678_CID_EXPOSURE_SHORT:
+		if (ctrl->flags & V4L2_CTRL_FLAG_INACTIVE)
+			return 0;
+
+		/* Set controls only if sensor is in power on state */
+		if (!pm_runtime_get_if_in_use(imx678->dev))
+			return 0;
+
+		exposure = ctrl->val;
+		analog_gain = imx678->sef1.again_ctrl->val;
+
+		dev_dbg(imx678->dev, "Received exp %u analog gain %u", exposure,
+			analog_gain);
+
+		ret = imx678_update_exp_gain(imx678, exposure, analog_gain, SEF1);
+
+		pm_runtime_put(imx678->dev);
+
+		break;
+	case IMX678_CID_EXPOSURE_VERY_SHORT:
+		if (ctrl->flags & V4L2_CTRL_FLAG_INACTIVE)
+			return 0;
+
+		/* Set controls only if sensor is in power on state */
+		if (!pm_runtime_get_if_in_use(imx678->dev))
+			return 0;
+
+		exposure = ctrl->val;
+		analog_gain = imx678->sef2.again_ctrl->val;
+
+		dev_dbg(imx678->dev, "Received exp %u analog gain %u", exposure,
+			analog_gain);
+
+		ret = imx678_update_exp_gain(imx678, exposure, analog_gain, SEF2);
 
 		pm_runtime_put(imx678->dev);
 
@@ -2385,18 +2672,18 @@ static int imx678_set_ctrl(struct v4l2_ctrl *ctrl)
 			return 0;
 		}
 
+		ret = 0;
 		if (imx678->hdr_enabled != ctrl->val) {
 			imx678->hdr_enabled = ctrl->val;
 			dev_dbg(imx678->dev, "hdr enable set to %d\n", imx678->hdr_enabled);
-			if (imx678->hdr_enabled)
-				imx678->cur_mode = &supported_hdr_modes[DEFAULT_MODE_IDX];
-			else
-				imx678->cur_mode = &supported_sdr_modes[DEFAULT_MODE_IDX];
-
+			imx678->cur_mode = imx678->hdr_enabled ? &supported_hdr_modes[DEFAULT_MODE_IDX] : &supported_sdr_modes[DEFAULT_MODE_IDX];
 			imx678->vblank = imx678->cur_mode->vblank;
+
+			v4l2_ctrl_activate(imx678->sef1.exp_ctrl, ctrl->val);
+			v4l2_ctrl_activate(imx678->sef2.exp_ctrl, ctrl->val);
+			ret = imx678_update_exp_vblank_controls(imx678);
 		}
-		ret = 0;
-		break;
+		break;		
 	default:
 		dev_err(imx678->dev, "Invalid control %d", ctrl->id);
 		ret = -EINVAL;
@@ -2423,11 +2710,11 @@ static int imx678_enum_mbus_code(struct v4l2_subdev *sd,
 	if (code->index > 0)
 		return -EINVAL;
 
-	if(imx678->hdr_enabled)
+	if (imx678->hdr_enabled)
 		supported_modes = (struct imx678_mode *)supported_hdr_modes;
 	else
 		supported_modes = (struct imx678_mode *)supported_sdr_modes;
-
+	
 	mutex_lock(&imx678->mutex);
 	code->code = supported_modes[DEFAULT_MODE_IDX].code;
 	mutex_unlock(&imx678->mutex);
@@ -2565,7 +2852,8 @@ static int imx678_get_fmt_mode(struct imx678* imx678, struct v4l2_subdev_format*
 	}
 	
 	for (index = 0; index < mode_count; ++index) {
-		if(supported_modes[index].width == fmt->format.width && supported_modes[index].height == fmt->format.height){
+		if (supported_modes[index].width == fmt->format.width && 
+		   supported_modes[index].height == fmt->format.height) {
 			*mode = &supported_modes[index];
 			return 0;
 		}
@@ -2601,8 +2889,11 @@ static int imx678_set_pad_format(struct v4l2_subdev *sd,
 
 	// even if which is V4L2_SUBDEV_FORMAT_TRY, update current format for tuning case
 	memcpy(&imx678->curr_fmt, fmt, sizeof(struct v4l2_subdev_format));
-	imx678->cur_mode = mode;
-	imx678->vblank = mode->vblank;
+	if (compare_imx678_mode(mode, imx678->cur_mode)) {
+		imx678->cur_mode = mode;
+		imx678->vblank = mode->vblank;
+		ret = imx678_update_exp_vblank_controls(imx678);
+	}
 #ifdef IMX678_UPDATE_CONTROLS_TRY_FMT
 		ret = imx678_update_controls(imx687, mode);
 #endif
@@ -2626,7 +2917,7 @@ static int imx678_init_pad_cfg(struct v4l2_subdev *sd,
 	struct imx678 *imx678 = to_imx678(sd);
 	struct v4l2_subdev_format fmt = { 0 };
 
-	if(imx678->hdr_enabled)
+	if (imx678->hdr_enabled)
 		supported_modes = (struct imx678_mode *)supported_hdr_modes;
 	else
 		supported_modes = (struct imx678_mode *)supported_sdr_modes;
@@ -2822,9 +3113,11 @@ static int imx678_s_frame_interval(struct v4l2_subdev *sd,
 
 	if (ret == 0) {
 		fi->interval = mode->frame_interval;
-		imx678->cur_mode = mode;
-		imx678->vblank = mode->vblank;
-		ret = __v4l2_ctrl_s_ctrl(imx678->vblank_ctrl, mode->vblank);
+		if (compare_imx678_mode(mode, imx678->cur_mode)) {
+			imx678->cur_mode = mode;
+			imx678->vblank = mode->vblank;
+			ret = imx678_update_exp_vblank_controls(imx678);
+		}
 	}
 
 	mutex_unlock(&imx678->mutex);
@@ -2856,19 +3149,19 @@ static int imx678_detect(struct imx678 *imx678)
 	int ret;
 	u32 val;
 
-	// IMX678_REG_ID that appeared in the SupportPackage value is 0 so check is irrelevant
-	return 0;
 
-	ret = imx678_read_reg(imx678, IMX678_REG_ID, 2, &val);
+	ret = imx678_read_reg(imx678, GENERIC_SENSOR_ID_REG, 1, &val);
 	if (ret)
 		return ret;
 
-	if (val != IMX678_ID) {
-		dev_err(imx678->dev, "chip id mismatch: %x!=%x", IMX678_ID,
-			val);
+	if (val != SENSOR_ID_IMX678) {
+        dev_info(imx678->dev,
+            "sensor is not connected: (expected %x, found %x)",
+			SENSOR_ID_IMX678, val);
 		return -ENXIO;
 	}
 
+	dev_info(imx678->dev, "sensor detected!");
 	return 0;
 }
 
@@ -3026,30 +3319,65 @@ static int imx678_init_controls(struct imx678 *imx678)
 {
 	struct v4l2_ctrl_handler *ctrl_hdlr = &imx678->ctrl_handler;
 	const struct imx678_mode *mode = imx678->cur_mode;
-	u32 lpfr;
+	struct ExposureLimits_t limits;
+	int ctrl_3dol_idx = 0;
 	int ret;
 
-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 7);
+	const int num_ctrls = 11;
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, num_ctrls);
 	if (ret)
 		return ret;
+
+	memset(&limits, 0, sizeof(struct ExposureLimits_t));
+	calculate_exposure_limits(imx678, &limits);
 
 	/* Serialize controls with sensor device */
 	ctrl_hdlr->lock = &imx678->mutex;
 
-	/* Initialize exposure and gain */
-	lpfr = mode->vblank_max + mode->height;
-	imx678->exp_ctrl = v4l2_ctrl_new_std(
+	/* Initialize exposure and gain LEF */
+	imx678->lef.exp_ctrl = v4l2_ctrl_new_std(
 		ctrl_hdlr, &imx678_ctrl_ops, V4L2_CID_EXPOSURE,
-		IMX678_EXPOSURE_MIN, lpfr - IMX678_EXPOSURE_OFFSET,
-		IMX678_EXPOSURE_STEP, IMX678_EXPOSURE_DEFAULT);
+		limits.exp_lef_min, limits.exp_lef_max,
+		IMX678_EXPOSURE_STEP, limits.exp_lef_default);
 
-	imx678->again_ctrl =
+	imx678->lef.again_ctrl =
 		v4l2_ctrl_new_std(ctrl_hdlr, &imx678_ctrl_ops,
 				  V4L2_CID_ANALOGUE_GAIN, IMX678_AGAIN_MIN,
 				  IMX678_AGAIN_MAX, IMX678_AGAIN_STEP,
 				  IMX678_AGAIN_DEFAULT);
+	
+	v4l2_ctrl_cluster(2, &imx678->lef.exp_ctrl);
 
-	v4l2_ctrl_cluster(2, &imx678->exp_ctrl);
+	/* Initialize exposure and gain SEF1 */
+	ctrl_3dol_idx = get_3dol_ctrl_index_by_name("exposure_short");
+	imx678_3dol_ctrls[ctrl_3dol_idx].min = limits.exp_sef1_min;
+	imx678_3dol_ctrls[ctrl_3dol_idx].max = limits.exp_sef1_max;
+	imx678_3dol_ctrls[ctrl_3dol_idx].def = limits.exp_sef1_default;
+	
+	imx678->sef1.exp_ctrl =
+		v4l2_ctrl_new_custom(ctrl_hdlr,
+				     &imx678_3dol_ctrls[ctrl_3dol_idx], NULL);
+	
+	ctrl_3dol_idx = get_3dol_ctrl_index_by_name("analogue_gain_short");
+	imx678->sef1.again_ctrl = v4l2_ctrl_new_custom(ctrl_hdlr,
+				     &imx678_3dol_ctrls[ctrl_3dol_idx], NULL);
+	
+	v4l2_ctrl_cluster(2, &imx678->sef1.exp_ctrl);
+
+	/* Initialize exposure and gain SEF2 */
+	ctrl_3dol_idx = get_3dol_ctrl_index_by_name("exposure_very_short");
+	imx678_3dol_ctrls[ctrl_3dol_idx].min = limits.exp_sef2_min;
+	imx678_3dol_ctrls[ctrl_3dol_idx].max = limits.exp_sef2_max;
+	imx678_3dol_ctrls[ctrl_3dol_idx].def = limits.exp_sef2_default;
+	
+	imx678->sef2.exp_ctrl =
+		v4l2_ctrl_new_custom(ctrl_hdlr, &imx678_3dol_ctrls[ctrl_3dol_idx], NULL);
+	
+	ctrl_3dol_idx = get_3dol_ctrl_index_by_name("analogue_gain_very_short");
+	imx678->sef2.again_ctrl = v4l2_ctrl_new_custom(ctrl_hdlr,
+				     &imx678_3dol_ctrls[ctrl_3dol_idx], NULL);
+	
+	v4l2_ctrl_cluster(2, &imx678->sef2.exp_ctrl);
 
 	imx678->vblank_ctrl =
 		v4l2_ctrl_new_std(ctrl_hdlr, &imx678_ctrl_ops, V4L2_CID_VBLANK,
@@ -3092,7 +3420,7 @@ static int imx678_init_controls(struct imx678 *imx678)
 	}
 
 	imx678->sd.ctrl_handler = ctrl_hdlr;
-
+	
 	return 0;
 }
 
@@ -3111,9 +3439,7 @@ static int imx678_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	imx678->dev = &client->dev;
-
-	dev_info(imx678->dev,
-		 "imx678 probe start =-=-=-=-=-=-=-=-=-=-=-=-==-\n");
+	dev_info(imx678->dev, "probe started");
 
 	/* Initialize subdev */
 	v4l2_i2c_subdev_init(&imx678->sd, client, &imx678_subdev_ops);
@@ -3134,7 +3460,10 @@ static int imx678_probe(struct i2c_client *client)
 
 	/* Check module identity */
 	ret = imx678_detect(imx678);
-	if (ret) {
+	if (ret == -ENXIO) {
+        // imx678 is not connected, but another sensor might be
+        goto error_power_off;
+    } else if (ret) {
 		dev_err(imx678->dev, "failed to find sensor: %d", ret);
 		goto error_power_off;
 	}
@@ -3163,8 +3492,7 @@ static int imx678_probe(struct i2c_client *client)
 
 	ret = v4l2_async_register_subdev_sensor(&imx678->sd);
 	if (ret < 0) {
-		dev_err(imx678->dev, "failed to register async subdev: %d",
-			ret);
+		dev_err(imx678->dev, "failed to register async subdev: %d", ret);
 		goto error_media_entity;
 	}
 
@@ -3172,7 +3500,8 @@ static int imx678_probe(struct i2c_client *client)
 	pm_runtime_enable(imx678->dev);
 	pm_runtime_idle(imx678->dev);
 
-	return 0;
+    dev_info(imx678->dev, "probe finished successfully");
+    return 0;
 
 error_media_entity:
 	media_entity_cleanup(&imx678->sd.entity);
@@ -3183,6 +3512,11 @@ error_power_off:
 error_mutex_destroy:
 	mutex_destroy(&imx678->mutex);
 
+    if (ret == -ENXIO) {
+        dev_info(imx678->dev, "exit probe, sensor not connected");
+    } else {
+        dev_err(imx678->dev, "probe failed with %d", ret);
+    }
 	return ret;
 }
 

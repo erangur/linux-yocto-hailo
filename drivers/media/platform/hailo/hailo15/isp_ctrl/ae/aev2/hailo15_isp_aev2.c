@@ -131,7 +131,6 @@ static int hailo15_isp_aev2_g_ctrl(struct v4l2_ctrl *ctrl)
 	case HAILO15_ISP_CID_AE_HIST_WEIGHT:
 	case HAILO15_ISP_CID_AE_EXP_INPUT:
 	case HAILO15_ISP_CID_AE_EXP_WINDOW:
-	case HAILO15_ISP_CID_AE_EXP_STATISTIC:
 		pr_debug("%s - got g_ctrl with id: 0x%x\n", __func__, ctrl->id);
 		ret = hailo15_isp_g_ctrl_event(isp_dev, isp_dev->ctrl_pad,
 					       ctrl);
@@ -462,18 +461,6 @@ const struct v4l2_ctrl_config hailo15_isp_aev2_ctrls[] = {
         .max  = 0xFFFF,
         .dims = {4},
     },
-    {
-        /* uint8_t array 4096*8bit*/
-        .ops  = &hailo15_isp_aev2_ctrl_ops,
-        .id   = HAILO15_ISP_CID_AE_EXP_STATISTIC,
-        .type = V4L2_CTRL_TYPE_U8,
-        .flags= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
-        .name = "isp_ae_exp_statistic",
-        .step = 1,
-        .min  = 0,
-        .max  = 0xFF,
-        .dims = {4096},
-    }
 };
 
 int hailo15_isp_aev2_ctrl_count(void)

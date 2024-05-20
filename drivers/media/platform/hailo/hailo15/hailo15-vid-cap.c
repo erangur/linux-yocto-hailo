@@ -279,17 +279,52 @@ static void hailo15_video_node_queue_clean(struct hailo15_video_node *vid_node,
 	spin_unlock_irqrestore(&vid_node->qlock, flags);
 }
 
-static int
-hailo15_video_node_subdev_set_stream(struct hailo15_video_node *vid_node,
-					 int enable)
+static int hailo15_pad_s_stream(struct hailo15_video_node *vid_node, int enable)
 {
+    struct v4l2_subdev *subdev;
+    struct media_pad *pad;
+    struct hailo15_pad_stream_status stream_status;
+    int ret;
+
+    if (WARN_ON(!vid_node))
+        return -EINVAL;
+    
+    // Check if the subdevice is initialized and connected, and skip otherwise
+    subdev = hailo15_video_remote_subdev(vid_node);
+    if (!subdev || !subdev->ctrl_handler)
+        return 0;
+
+    pad = media_entity_remote_pad(&vid_node->pad);
+    stream_status.pad = pad->index;
+    stream_status.status = enable;
+
+    ret = v4l2_subdev_call(subdev, core, ioctl, HAILO15_PAD_S_STREAM, &stream_status);
+    if (ret) {
+        pr_err("%s - failure on subdev call, return code %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+static int hailo15_video_node_subdev_set_stream(
+    struct hailo15_video_node *vid_node, int enable)
+{
+    int ret;
+
 	if (WARN_ON(!vid_node))
 		return -EINVAL;
 
 	// set the grp_id of subdev to indicate from which pad the call came
 	vid_node->direct_sd->grp_id = vid_node->path;
 
-	return hailo15_subdev_call(vid_node, video, s_stream, enable);
+	ret = hailo15_subdev_call(vid_node, video, s_stream, enable);
+    if (ret) {
+        pr_err("%s - failed to set stream on subdev, subdev call returned %d\n", __func__, ret);
+        return ret;
+    }
+    
+    // Also mark the stream status on the pad
+    return hailo15_pad_s_stream(vid_node, enable);
 }
 
 static int hailo15_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
@@ -313,14 +348,6 @@ static int hailo15_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
 			return -EINVAL;
 		}
 		mutex_unlock(&vid_node->ioctl_mutex);
-		return 0;
-
-		ret = hailo15_video_node_subdev_set_stream(vid_node, 1);
-		if (!ret) {
-			vid_node->streaming = 1;
-		}
-		mutex_unlock(&vid_node->ioctl_mutex);
-		return ret;
 	}
 
 	return 0;
@@ -344,14 +371,6 @@ static int hailo15_streamoff(struct file *file, void *priv,
 	}
 
 	ret = vb2_ioctl_streamoff(file, priv, i);
-	mutex_unlock(&vid_node->ioctl_mutex);
-	return ret;
-
-	ret = hailo15_video_node_subdev_set_stream(vid_node, 0);
-	if (!ret) {
-		vid_node->streaming = 0;
-	}
-
 	mutex_unlock(&vid_node->ioctl_mutex);
 	return ret;
 }
@@ -686,10 +705,9 @@ static long hailo15_video_node_unlocked_ioctl(struct file *file,
 	long ret;
 	struct hailo15_video_node *vid_node = video_drvdata(file);
 	struct hailo15_dma_ctx *ctx;
-	uint64_t fc;
+	uint64_t fc = 0;
 	struct hailo15_vsm vsm;
 	struct hailo15_get_vsm_params vsm_params;
-	fc = 0;
 
 	if (WARN_ON(!vid_node)) {
 		return -EINVAL;
@@ -728,6 +746,16 @@ static long hailo15_video_node_unlocked_ioctl(struct file *file,
 			sizeof(struct hailo15_vsm));
 		mutex_unlock(&vid_node->ioctl_mutex);
 		break;
+	case VIDEO_WAIT_FOR_STREAM_START:
+		mutex_lock(&vid_node->ioctl_mutex);
+		if(vid_node->streaming){
+			ret = 0;
+			mutex_unlock(&vid_node->ioctl_mutex);
+			break;
+		}
+		mutex_unlock(&vid_node->ioctl_mutex);
+		ret = wait_event_interruptible(vid_node->stream_wait, vid_node->streaming);
+		break;
 	default:
 		/* video ioctls locks are handled by v4l2 framework */
 		ret = video_ioctl2(file, cmd, arg);
@@ -752,7 +780,7 @@ static int hailo15_video_node_stream_cancel(struct hailo15_video_node *vid_node)
 	}
 
 	hailo15_video_node_queue_clean(vid_node, VB2_BUF_STATE_ERROR);
-	vid_node->streaming = 0;
+	vid_node->streaming = STREAM_OFF;
 
 	if (vid_node->path != VID_GRP_P2A) {
 		ret = hailo15_video_post_event_release_pipeline(vid_node);
@@ -797,7 +825,7 @@ int hailo15_video_node_release(struct file *file)
 	}
 
 	if (file->private_data == vid_node->queue.owner) {
-		vb2_fop_release(file);
+		return vb2_fop_release(file);
 	}
 
 	return 0;
@@ -1132,7 +1160,7 @@ static int hailo15_buffer_prepare(struct vb2_buffer *vb)
 int hailo15_video_node_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct hailo15_video_node *vid_node = queue_to_node(q);
-	int ret = 0;
+	int ret = -EINVAL;
 
 	if (WARN_ON(!vid_node))
 		return -EINVAL;
@@ -1147,7 +1175,9 @@ int hailo15_video_node_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 
 		vid_node->streaming = 1;
+		wake_up_interruptible(&vid_node->stream_wait);
 	}
+
 	goto out;
 err:
 	hailo15_video_node_queue_clean(vid_node, VB2_BUF_STATE_QUEUED);
@@ -1163,6 +1193,7 @@ void hailo15_video_node_stop_streaming(struct vb2_queue *q)
 		return;
 
 	hailo15_video_node_stream_cancel(vid_node);
+    
 }
 
 static struct vb2_ops hailo15_buffer_ops = {
@@ -1380,7 +1411,7 @@ hailo15_video_node_init_v4l2_device(struct hailo15_video_node *vid_node)
 		goto err_register_subdev_nodes;
 	}
 
-	ret = v4l2_device_register_subdev_nodes(vid_node->v4l2_dev);
+	ret = hailo15_media_register_video_subdev_nodes(vid_node->v4l2_dev);
 	if (ret) {
 		pr_err("%sFailed registering the subdevs with code %d \n",
 			   __func__, ret);
@@ -1478,6 +1509,9 @@ static int hailo15_video_node_init(struct hailo15_video_node *vid_node)
 			vid_node->id);
 		goto err_create_links;
 	}
+
+	init_waitqueue_head(&vid_node->stream_wait);
+
 	goto out;
 
 err_create_links:
@@ -1623,8 +1657,8 @@ static int hailo15_video_probe(struct platform_device *pdev)
 
 	mutex_init(&sd_mutex);
 
+    dev_info(&pdev->dev, "Video device probe finished successfully");
 	goto out;
-	pr_debug("video device probe success\n");
 err_init_nodes:
 	kfree(vid_dev);
 out:

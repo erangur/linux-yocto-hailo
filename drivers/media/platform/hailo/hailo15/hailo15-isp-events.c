@@ -104,7 +104,7 @@ int hailo15_isp_post_event(struct video_device *vdev,
 
 		if (data) {
 			if (data_size == 0 || data_size > HAILO15_EVENT_RESOURCE_SIZE) {
-				pr_err("%s - got data but data size is 0\n", __func__);
+				pr_err("%s - got data with bad data size: %ld\n", __func__, data_size);
 				mutex_unlock(&event_resource->event_lock);
 				return -EINVAL;
 			} else {
@@ -162,20 +162,12 @@ int hailo15_isp_post_event_set_fmt(struct hailo15_isp_device *isp_dev,
 
 int hailo15_isp_post_event_start_stream(struct hailo15_isp_device *isp_dev)
 {
-	hailo15_daemon_event_meta_t meta = {
-		HAILO15_DAEMON_ISP_EVENT, HAILO15_DAEMON_ISP_EVENT_STREAMON
-	};
-	return hailo15_isp_post_event(isp_dev->sd.devnode, meta,
-					&(isp_dev->event_resource), 0, NULL, 0);
+	return hailo15_isp_s_stream_event(isp_dev, 0, 1);
 }
 
 int hailo15_isp_post_event_stop_stream(struct hailo15_isp_device *isp_dev)
 {
-	hailo15_daemon_event_meta_t meta = {
-		HAILO15_DAEMON_ISP_EVENT, HAILO15_DAEMON_ISP_EVENT_STREAMOFF
-	};
-	return hailo15_isp_post_event(isp_dev->sd.devnode, meta,
-					&(isp_dev->event_resource), 0, NULL, 0);
+	return hailo15_isp_s_stream_event(isp_dev, 0, 0);
 }
 
 int hailo15_isp_post_event_requebus(struct hailo15_isp_device *isp_dev,
@@ -184,8 +176,7 @@ int hailo15_isp_post_event_requebus(struct hailo15_isp_device *isp_dev,
 	hailo15_daemon_event_meta_t meta = { HAILO15_DAEMON_ISP_EVENT,
 						 HAILO15_DAEMON_ISP_EVENT_REQBUFS };
 	return hailo15_isp_post_event(isp_dev->sd.devnode, meta,
-					&(isp_dev->event_resource), pad, NULL,
-					0);
+					&(isp_dev->event_resource), pad, NULL, 0);
 }
 
 int hailo15_isp_s_stream_event(struct hailo15_isp_device *isp_dev, int pad, uint32_t status)
@@ -193,8 +184,7 @@ int hailo15_isp_s_stream_event(struct hailo15_isp_device *isp_dev, int pad, uint
     hailo15_daemon_event_meta_t meta = { HAILO15_DAEMON_ISP_EVENT,
 						 (status ? HAILO15_DAEMON_ISP_EVENT_STREAMON : HAILO15_DAEMON_ISP_EVENT_STREAMOFF) };
 	return hailo15_isp_post_event(isp_dev->sd.devnode, meta,
-					&(isp_dev->event_resource), pad, NULL,
-					0);
+					&(isp_dev->event_resource), pad, NULL, 0);
 }
 
 int hailo15_isp_s_ctrl_event(struct hailo15_isp_device *isp_dev, int pad,

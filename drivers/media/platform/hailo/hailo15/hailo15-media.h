@@ -5,6 +5,8 @@
 #include <linux/of_platform.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-subdev.h>
+#include <media/v4l2-async.h>
+#include <stdbool.h>
 #include "common.h"
 
 struct hailo15_media_device {
@@ -26,6 +28,9 @@ int hailo15_media_register_v4l2_device(struct v4l2_device* v4l2_dev, int id);
 void hailo15_media_init_media_device(struct device* dev);
 struct media_device* hailo15_media_get_media_device(void);
 int hailo15_media_get_subdev(struct device *dev, int id, struct v4l2_subdev **sd);
+struct v4l2_async_notifier* hailo15_media_find_child_notifier(struct v4l2_async_notifier *notifier);
+bool hailo15_media_check_completion(struct v4l2_async_notifier *notifier);
+int hailo15_media_register_video_subdev_nodes(struct v4l2_device *video_dev);
 void hailo15_media_entity_clean(struct media_entity *entity);
 void hailo15_media_clean_media_device(void);
 int hailo15_media_device_initialized(void);

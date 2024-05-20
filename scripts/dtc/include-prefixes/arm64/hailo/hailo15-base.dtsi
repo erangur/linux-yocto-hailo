@@ -1,0 +1,45 @@
+// SPDX-License-Identifier:     GPL-2.0
+/*
+ * Copyright (c) 2019-2024 Hailo Technologies Ltd. All rights reserved.
+ */
+
+#define HAILO_SOC_TYPE HAILO_SOC_HAILO15
+#include "hailo15-family-base.dtsi"
+
+
+/ {
+    soc {
+        compatible = "hailo,hailo15";
+    };
+
+    sram@d0000 {
+        cpu_scp_i2s_dma_shmem: scp-shmem@10a0 {
+            compatible = "hailo,hailo15-i2s-shmem";
+            reg = <0 0x10a0 0 0xf60>;
+        };
+    };
+
+    i2s_cpu_master: audio-controller-master@10d000 {
+        compatible = "hailo,hailo15-designware-i2s-scu-dma";
+        reg = <0x0 0x10d000 0x0 0x400>;
+        shmem = <&cpu_scp_i2s_dma_shmem>;
+        clocks = <&scmi_clk HAILO15_SCMI_CLOCK_IDX_I2S_CLK_DIV>;
+        clock-names = "i2sclk";
+		#sound-dai-cells = <0>;
+        interrupts = <GIC_SPI HW_INTERRUPTS__I2S_IRQ IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "i2s_irq";
+        status = "disabled";
+    };
+
+    pl320_mailbox: mailbox {
+        reg = <0 0x78002000 0 0x1000>;
+    };
+
+    pinctrl: pinctrl@7c291000 {
+        compatible = "hailo15,pinctrl";
+        reg = <0 0x7c291000 0 0x1000>,
+                <0 0x7c292000 0 0x1000>;
+        reg-names = "general_pads_config_base", "gpio_pads_config_base";
+    };
+
+};

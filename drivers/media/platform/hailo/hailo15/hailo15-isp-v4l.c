@@ -6,6 +6,7 @@
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
+#include <linux/kernel.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-fh.h>
@@ -15,6 +16,7 @@
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-ctrls.h>
 #include <isp_ctrl/hailo15_isp_ctrl.h>
+#include <stdbool.h>
 #include "hailo15-isp.h"
 #include "hailo15-isp-hw.h"
 #include "hailo15-media.h"
@@ -84,33 +86,6 @@ extern int hailo15_isp_dma_set_enable(struct hailo15_isp_device *, int, int);
 extern void hailo15_fe_get_dev(struct vvcam_fe_dev** dev);
 extern void hailo15_fe_set_address_space_base(struct vvcam_fe_dev* fe_dev,void* base);
 
-struct hailo15_isp_mbus_fmt hailo15_isp_mp_fmts[] = {
-    {
-        .code = MEDIA_BUS_FMT_YUYV8_2X8,   /*NV16*/
-    },
-    {
-        .code = MEDIA_BUS_FMT_YUYV8_1_5X8, /*NV12*/
-    },
-    {
-        .code = MEDIA_BUS_FMT_YUYV8_1X16,  /*YUYV*/
-    },
-};
-
-struct hailo15_isp_mbus_fmt hailo15_isp_sp_fmts[] = {
-    {
-        .code = MEDIA_BUS_FMT_YUYV8_2X8,   /*NV16*/
-    },
-    {
-        .code = MEDIA_BUS_FMT_YUYV8_1_5X8, /*NV12*/
-    },
-    {
-        .code = MEDIA_BUS_FMT_YUYV8_1X16,  /*YUYV*/
-    },
-    {
-        .code = MEDIA_BUS_FMT_BGR888_1X24,
-    }
-};
-
 struct hailo15_af_kevent af_kevent;
 EXPORT_SYMBOL(af_kevent);
 
@@ -118,7 +93,7 @@ struct vvcam_fe_dev* fe_dev = NULL;
 
 static irqreturn_t hailo15_isp_irq_handler(int irq, void *isp_dev)
 {
-	return hailo15_isp_irq_process(isp_dev);
+    return hailo15_isp_irq_process(isp_dev);
 }
 
 static struct hailo15_isp_device* isp_dev_from_v4l2_subdev(struct v4l2_subdev *sd)
@@ -182,43 +157,19 @@ static int hailo15_isp_requbufs(struct v4l2_subdev *sd, void *arg)
     return hailo15_isp_post_event_requebus(isp_dev, pad_requbufs->pad, pad_requbufs->num_buffers);
 }
 
-static int hailo15_isp_pad_buf_queue(struct v4l2_subdev *sd, void *arg)
-{
-    struct hailo15_pad_buf *pad_buf = (struct hailo15_pad_buf *)arg;
-    struct hailo15_isp_device *isp_dev = isp_dev_from_v4l2_subdev(sd);
-
-    unsigned long flags;
-    struct hailo15_isp_pad_data *cur_pad;
-
-    cur_pad = &isp_dev->pad_data[pad_buf->pad];
-
-    spin_lock_irqsave(&cur_pad->qlock, flags);
-
-    list_add_tail(&pad_buf->buf->list, &cur_pad->queue);
-
-	spin_unlock_irqrestore(&cur_pad->qlock, flags);
-
-    return 0;
-}
-
 static int hailo15_isp_pad_s_stream(struct v4l2_subdev *sd, void *arg)
 {
     struct hailo15_pad_stream_status *pad_stream = (struct hailo15_pad_stream_status *)arg;
     struct hailo15_isp_device *isp_dev = isp_dev_from_v4l2_subdev(sd);
-    int ret = 0;
 
     isp_dev->pad_data[pad_stream->pad].stream = pad_stream->status;
 
-    if (pad_stream->status == 0 ) {
-        INIT_LIST_HEAD(&isp_dev->pad_data[pad_stream->pad].queue);
-        INIT_LIST_HEAD(&isp_dev->pad_data[pad_stream->pad].mcm_queue);
-        isp_dev->pad_data[pad_stream->pad].buf = NULL;
-        isp_dev->pad_data[pad_stream->pad].shd_buf = NULL;
-        isp_dev->pad_data[pad_stream->pad].sequence = 0;
-    }
-    ret = hailo15_isp_s_stream_event(isp_dev, pad_stream->pad, pad_stream->status);
+    /* This function does not actually start the stream on the selected pad at the moment
+     * It is only used to set the stream status on the pad_data structure.
+     * The stream is started by the hailo15_isp_s_stream_event function,
+     * which currently always uses pad 0 */
 
-    return ret;
+    return 0;
 }
 
 static int hailo15_isp_mcm_extract_mode(struct v4l2_subdev *sd, void *arg)
@@ -239,162 +190,6 @@ static int hailo15_isp_mcm_set_mode(struct v4l2_subdev *sd, void *arg)
     return 0;
 }
 
-struct hailo15_vb2_buffer *hailo15_isp_hal_pad_buf(struct hailo15_isp_device *isp_dev, int pad)
-{
-    unsigned long flags;
-    struct hailo15_isp_pad_data *isp_pad;
-    struct hailo15_vb2_buffer *buf = NULL;
-
-    isp_pad = &isp_dev->pad_data[pad];
-
-    spin_lock_irqsave(&isp_pad->qlock, flags);
-
-    if (list_empty(&isp_pad->queue)) {
-        spin_unlock_irqrestore(&isp_pad->qlock, flags);
-        return NULL;
-    }
-
-    buf = list_first_entry(&isp_pad->queue, struct hailo15_vb2_buffer, list);
-    list_del(&buf->list);
-
-	spin_unlock_irqrestore(&isp_pad->qlock, flags);
-
-    return buf;
-}
-
-static int hailo15_isp_hal_pad_buffer_done(struct hailo15_isp_device *isp_dev, int pad_index, struct hailo15_vb2_buffer *buf)
-{
-    struct media_pad *pad;
-    struct v4l2_subdev *subdev;
-    struct video_device *video;
-    struct hailo15_pad_buf pad_buf;
-    int ret;
-
-    if (isp_dev->pad_data[pad_index].stream == 0)
-        return 0;
-
-    pad = media_entity_remote_pad(&isp_dev->pads[pad_index]);
-
-    if (!pad)
-        return -EINVAL;
-    if (is_media_entity_v4l2_subdev(pad->entity)) {
-
-        subdev = media_entity_to_v4l2_subdev(pad->entity);
-        pad_buf.pad = pad->index;
-        pad_buf.buf = buf;
-        ret = v4l2_subdev_call(subdev, core, ioctl, HAILO15_PAD_BUF_DONE, &pad_buf);
-        if (ret)
-            return ret;
-
-    } else if (is_media_entity_v4l2_video_device(pad->entity)){
-        video = media_entity_to_video_device(pad->entity);
-        if (buf->sequence < video->queue->num_buffers) {
-            if (buf->vb.vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
-                buf->vb.vb2_buf.timestamp = ktime_get_ns();
-                buf->vb.field = isp_dev->pad_data[pad_index].format.field;
-                buf->vb.sequence = isp_dev->pad_data[pad_index].sequence++;
-                vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
-            }
-        }
-    }
-
-    return 0;
-}
-
-static int hailo15_isp_buf_done(struct v4l2_subdev *sd, void *arg)
-{
-    struct isp_mcm_buf *mcm_buf = (struct isp_mcm_buf *)arg;
-    uint32_t pad;
-    struct hailo15_vb2_buffer *buf = NULL, *pos, *next;
-    struct hailo15_isp_device *isp_dev = isp_dev_from_v4l2_subdev(sd);
-    unsigned long flags;
-    struct hailo15_isp_pad_data *isp_pad;
-
-    pad = HAILO15_ISP_SOURCE_PAD_MP_BEGIN + (mcm_buf->path * HAILO15_ISP_PATHS_MAX) + mcm_buf->port;
-    isp_pad = &isp_dev->pad_data[pad];
-
-    if (!isp_pad->stream)
-        return -EINVAL;
-
-    spin_lock_irqsave(&isp_pad->qlock, flags);
-
-    list_for_each_entry_safe(pos, next, &isp_pad->mcm_queue, list) {
-        if (pos && (pos->planes[0].dma_addr == mcm_buf->addr[0])) {
-           buf = pos;
-           list_del(&pos->list);
-           break;
-        }
-    }
-
-    spin_unlock_irqrestore(&isp_pad->qlock, flags);
-
-    if (buf) {
-        // if buf queue is empty, drop the frame
-        spin_lock_irqsave(&isp_pad->qlock, flags);
-        if (list_empty(&isp_pad->queue)) {
-            list_add_tail(&buf->list, &isp_pad->queue);
-            spin_unlock_irqrestore(&isp_pad->qlock, flags);
-            return 0;
-        }
-        spin_unlock_irqrestore(&isp_pad->qlock, flags);
-
-        hailo15_isp_hal_pad_buffer_done(isp_dev, pad, buf);
-    }
-
-    return 0;
-}
-
-static int hailo15_isp_dqbuf(struct v4l2_subdev *sd, void *arg)
-{
-    struct isp_mcm_buf *mcm_buf = (struct isp_mcm_buf *)arg;
-    uint32_t pad;
-    struct hailo15_vb2_buffer *buf;
-    struct hailo15_isp_device *isp_dev = isp_dev_from_v4l2_subdev(sd);
-    struct hailo15_isp_fmt_size *fmt_size;
-    unsigned long flags;
-    struct hailo15_isp_pad_data *isp_pad;
-
-    pad = HAILO15_ISP_SOURCE_PAD_MP_BEGIN + (mcm_buf->path * HAILO15_ISP_PATHS_MAX) + mcm_buf->port;
-    isp_pad = &isp_dev->pad_data[pad];
-
-    if (!isp_pad->stream)
-        return -EINVAL;
-
-    fmt_size = &isp_dev->pad_data[pad].fmt_size;
-
-    buf = hailo15_isp_hal_pad_buf(isp_dev, pad);
-    if (!buf)
-        return -ENOMEM;
-
-    mcm_buf->num_planes = fmt_size->num_planes;
-    if (buf->vb.vb2_buf.type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
-        mcm_buf->addr[0] = buf->planes[0].dma_addr;
-        mcm_buf->size[0] = fmt_size->planes_size[0];
-
-        mcm_buf->addr[1] = buf->planes[0].dma_addr + fmt_size->planes_offset[1];
-        mcm_buf->size[1] = fmt_size->planes_size[1];
-
-        mcm_buf->addr[2] = buf->planes[0].dma_addr + fmt_size->planes_offset[2];;
-        mcm_buf->size[2] = fmt_size->planes_size[2];
-
-    } else {
-        mcm_buf->addr[0] = buf->planes[0].dma_addr;
-        mcm_buf->size[0] = buf->planes[0].size;
-        mcm_buf->addr[1] = buf->planes[1].dma_addr;
-        mcm_buf->size[1] = buf->planes[1].size;
-        mcm_buf->addr[2] = buf->planes[2].dma_addr;
-        mcm_buf->size[2] = buf->planes[2].size;
-    }
-
-    mcm_buf->addr[1] = (mcm_buf->size[1] != 0) ? mcm_buf->addr[1] : 0;
-    mcm_buf->addr[2] = (mcm_buf->size[2] != 0) ? mcm_buf->addr[2] : 0;
-
-    spin_lock_irqsave(&isp_pad->qlock, flags);
-    list_add_tail(&buf->list, &isp_pad->mcm_queue);
-    spin_unlock_irqrestore(&isp_pad->qlock, flags);
-
-    return 0;
-}
 
 /******************************/
 /* VSI infrastructure support */
@@ -520,10 +315,10 @@ static int hailo15_isp_try_ext_ctrls(struct v4l2_subdev *sd, void *arg)
 
 static int hailo15_isp_stat_subscribe(struct v4l2_subdev *sd, void *arg)
 {
-    int ret = 0;
 	struct hailo15_isp_device *isp_dev = isp_dev_from_v4l2_subdev(sd);
-    struct hailo15_pad_stat_subscribe *pad_sub = (struct hailo15_pad_stat_subscribe *)arg;
+    struct hailo15_pad_stat_subscribe *pad_sub = (struct hailo15_pad_stat_subscribe*)arg;
     struct hailo15_isp_pad_data *cur_pad = &isp_dev->pad_data[pad_sub->pad];
+    int ret = 0;
 
     if (pad_sub->type != HAILO15_UEVENT_ISP_STAT) {
         return -EINVAL;
@@ -538,6 +333,9 @@ static int hailo15_isp_stat_subscribe(struct v4l2_subdev *sd, void *arg)
             cur_pad->stat_sub[pad_sub->id] = *pad_sub;
         }
     }
+
+    if (ret == 0)
+        pr_info("subscribed to isp stat event %d on pad %d\n", pad_sub->id, pad_sub->pad);
 
     return ret;
 }
@@ -557,10 +355,12 @@ static int hailo15_isp_stat_unsubscribe(struct v4l2_subdev *sd, void *arg)
         ret = -EINVAL;
     } else {
         if (cur_pad->stat_sub[pad_sub->id].type == 0) {
-            pr_err("%s stat event %d is not subscribed\n", __func__, pad_sub->id);
+            pr_err("%s: stat event %d is not subscribed\n", __func__, pad_sub->id);
             return -EINVAL;
         }
+
         memset(&cur_pad->stat_sub[pad_sub->id], 0, sizeof(*pad_sub));
+        pr_info("unsubscribed from isp stat event %d on pad %d\n", pad_sub->id, pad_sub->pad);
     }
 
     return ret;
@@ -614,7 +414,9 @@ static long hailo15_vsi_isp_priv_ioctl(struct v4l2_subdev *sd, unsigned int cmd,
 	case ISPIOC_V4L2_MI_START:
 		mutex_lock(&isp_dev->mlock);
 		for (path = ISP_MP; path < ISP_MAX_PATH; ++path) {
-			if (isp_dev->cur_buf[path] &&
+			if(isp_dev->mcm_mode && path == ISP_MCM_IN){
+				hailo15_isp_configure_frame_size(isp_dev, path);
+			}else if (isp_dev->cur_buf[path] &&
 				isp_dev->mi_stopped[path] &&
 				hailo15_isp_is_path_enabled(isp_dev, path)) {
 				hailo15_isp_configure_frame_size(isp_dev, path);
@@ -638,17 +440,10 @@ static long hailo15_vsi_isp_priv_ioctl(struct v4l2_subdev *sd, unsigned int cmd,
 		break;
 	case ISPIOC_V4L2_SET_MCM_MODE:
         ret = hailo15_isp_mcm_set_mode(sd, arg);
-		ret = 0;
 		break;
 	case ISPIOC_V4L2_MCM_MODE:
         ret = hailo15_isp_mcm_extract_mode(sd, arg);
 		break;
-    case ISPIOC_V4L2_MCM_DQBUF:
-        ret = hailo15_isp_dqbuf(sd, arg);
-        break;
-    case ISPIOC_V4L2_MCM_BUF_DONE:
-        ret = hailo15_isp_buf_done(sd, arg);
-        break;
 	case ISPIOC_V4L2_REQBUFS:
 		ret = hailo15_isp_requbufs(sd, arg);
 		break;
@@ -665,16 +460,9 @@ static long hailo15_vsi_isp_priv_ioctl(struct v4l2_subdev *sd, unsigned int cmd,
 		ret = 0;
 		break;
 
-    case HAILO15_PAD_REQBUFS:
-        ret = hailo15_isp_requbufs(sd, arg);
-        break;
-    case HAILO15_PAD_BUF_QUEUE:
-        ret = hailo15_isp_pad_buf_queue(sd, arg);
-        break;
     case HAILO15_PAD_S_STREAM:
         ret = hailo15_isp_pad_s_stream(sd, arg);
         break;
-
 	case HAILO15_PAD_QUERYCTRL:
 		ret = hailo15_isp_queryctrl(sd, arg);
 		break;
@@ -699,7 +487,6 @@ static long hailo15_vsi_isp_priv_ioctl(struct v4l2_subdev *sd, unsigned int cmd,
 	case HAILO15_PAD_QUERYMENU:
 		ret = hailo15_isp_querymenu(sd, arg);
 		break;
-
 	case HAILO15_PAD_STAT_SUBSCRIBE:
 		ret = hailo15_isp_stat_subscribe(sd, arg);
 		break;
@@ -860,6 +647,7 @@ static int hailo15_isp_s_stream(struct v4l2_subdev *sd, int enable)
 		if(path == ISP_MCM_IN){
 			isp_dev->mcm_mode = 1;
 			isp_dev->rdma_enable = 1;
+			isp_dev->fe_enable = 1;
 			isp_dev->dma_ready = 0;
 			isp_dev->frame_end = 0;
 			isp_dev->fe_ready = 0;
@@ -874,6 +662,11 @@ static int hailo15_isp_s_stream(struct v4l2_subdev *sd, int enable)
 
 		isp_dev->queue_empty[path] = 0;
 		isp_dev->current_vsm_index[path] = -1;
+		ret = hailo15_isp_post_event_start_stream(isp_dev);
+		if (ret) {
+			pr_warn("%s - start stream event failed with %d\n", __func__, ret);
+			return ret;
+		}
 	}
 	if(!isp_dev->rdma_enable){
 		pad = &isp_dev->pads[HAILO15_ISP_SINK_PAD_S0];
@@ -898,6 +691,7 @@ static int hailo15_isp_s_stream(struct v4l2_subdev *sd, int enable)
 			isp_dev->dma_ready = 0;
 			isp_dev->frame_end = 0;
 			isp_dev->fe_ready = 0;
+			isp_dev->fe_enable = 0;
 			spin_lock_irqsave(&isp_dev->mcm_lock, flags);
 			list_for_each_entry_safe(pos, npos, &isp_dev->mcm_queue, irqlist){
 				hailo15_dma_buffer_done(ctx, ISP_PATH_TO_VID_GRP(path), pos);
@@ -909,7 +703,6 @@ static int hailo15_isp_s_stream(struct v4l2_subdev *sd, int enable)
 
 			return 0;
 		}
-		hailo15_isp_refcnt_dec_disable(isp_dev);
 
 		isp_dev->frame_count[path] = 0;
 		isp_dev->mi_stopped[path] = 1;
@@ -922,6 +715,8 @@ static int hailo15_isp_s_stream(struct v4l2_subdev *sd, int enable)
 			isp_dev->rmem_vaddr = 0;
 		}
 
+		hailo15_isp_reset_hw(isp_dev);
+		hailo15_isp_refcnt_dec_disable(isp_dev);
 		return ret;
 	}
 	
@@ -930,7 +725,6 @@ static int hailo15_isp_s_stream(struct v4l2_subdev *sd, int enable)
 		hailo15_isp_configure_buffer(isp_dev, isp_dev->cur_buf[path]);
 	}
 
-	ret = hailo15_isp_post_event_start_stream(isp_dev);
 	if(isp_dev->rdma_enable)
 		hailo15_isp_configure_frame_size(isp_dev, ISP_MCM_IN);
 	return ret;
@@ -1346,17 +1140,16 @@ static int hailo15_isp_init_platdev(struct hailo15_isp_device *isp_dev)
 		return PTR_ERR(isp_dev->ip_clk);
 	}
 
-	isp_dev->irq = platform_get_irq(pdev, 0);
+	isp_dev->irq = platform_get_irq(pdev, HAILO15_ISP_IRQ_EVENT_ISP_MIS);
 	if (isp_dev->irq < 0) {
-		dev_err(dev, "can't get irq resource\n");
+		dev_err(dev, "can't get isp irq resource\n");
 		return -ENXIO;
 	}
 
 	ret = devm_request_irq(dev, isp_dev->irq, hailo15_isp_irq_handler, 0,
 				   dev_name(dev), isp_dev);
-
 	if (ret) {
-		dev_err(dev, "request irq error\n");
+		dev_err(dev, "request isp irq error\n");
 		return ret;
 	}
 
@@ -1410,27 +1203,6 @@ hailo15_isp_init_pads(struct hailo15_isp_device *isp_dev)
 	for (; pad < HAILO15_ISP_SOURCE_PAD_MAX; ++pad) {
 		isp_dev->pads[pad].flags = MEDIA_PAD_FL_SOURCE;
 	}
-
-    // Initialize pad data for each source pad
-    for (pad = HAILO15_ISP_SOURCE_PAD_MP_BEGIN;
-            pad < HAILO15_ISP_SOURCE_PAD_MP_END; ++pad) {
-        isp_dev->pad_data[pad].num_formats = ARRAY_SIZE(hailo15_isp_mp_fmts);
-        isp_dev->pad_data[pad].mbus_fmt = hailo15_isp_mp_fmts;
-    }
-
-    for (pad = HAILO15_ISP_SOURCE_PAD_SP_BEGIN;
-            pad < HAILO15_ISP_SOURCE_PAD_SP_END; ++pad) {
-        isp_dev->pad_data[pad].num_formats = ARRAY_SIZE(hailo15_isp_sp_fmts);
-        isp_dev->pad_data[pad].mbus_fmt = hailo15_isp_sp_fmts;
-    }
-
-    // Initialize the queue and lock for each source pad
-    for (pad = HAILO15_ISP_SOURCE_PAD_BEGIN;
-            pad < HAILO15_ISP_SOURCE_PAD_END; ++pad) {
-        INIT_LIST_HEAD(&isp_dev->pad_data[pad].queue);
-        spin_lock_init(&isp_dev->pad_data[pad].qlock);
-        INIT_LIST_HEAD(&isp_dev->pad_data[pad].mcm_queue);
-    }
 
 	ret = media_entity_pads_init(&isp_dev->sd.entity, HAILO15_ISP_PADS_NR,
 					 isp_dev->pads);
@@ -1691,6 +1463,179 @@ static int hailo15_isp_remove(struct platform_device *pdev)
 	dev_info(isp_dev->dev, "hailo15 isp driver removed\n");
 	return 0;
 }
+
+static int hailo15_isp_hal_pad_stat_done(struct hailo15_isp_device *isp_dev,
+        struct hailo15_pad_stat *pad_stat)
+{
+    struct media_pad *pad;
+    struct video_device *video;
+    struct v4l2_event event;
+
+    static_assert(sizeof(event.u.data) == sizeof(pad_stat->reserved),
+        "event.u.data and pad_stat->reserved are not the same size");
+
+    pad = media_entity_remote_pad(&isp_dev->pads[pad_stat->pad]);
+    if (!pad)
+        return -EINVAL;
+
+    if (!is_media_entity_v4l2_video_device(pad->entity)) {
+        pr_err("received unexpected pad entity type %d\n", pad->entity->obj_type);
+        return -EINVAL;
+    }
+
+    video = media_entity_to_video_device(pad->entity);
+    event.id = pad_stat->id;
+    event.type = pad_stat->type;
+    memcpy(event.u.data, pad_stat->reserved, sizeof(pad_stat->reserved));
+
+    v4l2_event_queue(video, &event);
+    return 0;
+}
+
+static bool hailo15_isp_pad_is_sink(struct hailo15_isp_device *isp_dev, int pad)
+{
+    bool by_flags = (isp_dev->pads[pad].flags & MEDIA_PAD_FL_SINK);
+    bool by_index = (pad < HAILO15_ISP_SINK_PAD_END);
+
+    if (by_flags != by_index)
+        pr_err("pad %d bad sink pad check! by_flags %d, by_index %d\n",
+            pad, by_flags, by_index);
+    
+    return by_index;
+}
+
+
+static int hailo15_process_pad_stat_sub(
+    struct hailo15_isp_device *isp_dev, uint8_t pad, uint32_t mis_reg,
+    enum hailo15_event_stat_id stat_id, uint32_t mis_mask,
+    void *data, size_t data_size)
+{
+    struct hailo15_pad_stat_subscribe *stat_sub = &isp_dev->pad_data[pad].stat_sub[stat_id];
+    struct hailo15_pad_stat pad_stat;
+
+    switch (stat_sub->type) {
+        case HAILO15_UEVENT_ISP_STAT:
+            break; // stat is subscribed, continue
+        case 0:
+            return 0; // stat is not subscribed
+        default:
+            pr_err("received unexpected stat sub type %x for pad %d\n",
+                stat_sub->type, pad);
+            return -EINVAL;
+    }
+
+    if (stat_sub->id != stat_id) {
+        pr_err("received unexpected stat sub id %d for pad %d, expected stat_id %d\n",
+            stat_sub->id, pad, stat_id);
+        return -EINVAL;
+    }
+    
+    if ((mis_reg & mis_mask) == 0)
+        return 0; // stat is not ready
+
+
+    memset(&pad_stat, 0, sizeof(pad_stat));
+    pad_stat.pad = pad;
+    pad_stat.type = HAILO15_UEVENT_ISP_STAT;
+    pad_stat.id = stat_id;
+
+    if (data) {
+        if (data_size == 0 || data_size > sizeof(pad_stat.reserved)) {
+            pr_err("unexpected data size %ld for pad %d\n", data_size, pad);
+            return -EINVAL;
+        }
+
+        memcpy(pad_stat.reserved, data, data_size);
+    }
+
+    return hailo15_isp_hal_pad_stat_done(isp_dev, &pad_stat);
+}
+
+static int hailo15_process_isp_pad_stat_sub(
+    struct hailo15_isp_device *isp_dev, uint8_t pad, uint32_t mis_reg,
+    enum hailo15_event_stat_id stat_id, uint32_t mis_mask)
+{
+    uint32_t *sequence = &isp_dev->pad_data[pad].sequence;
+    
+    return hailo15_process_pad_stat_sub(isp_dev, pad, mis_reg,
+        stat_id, mis_mask, sequence, sizeof(*sequence));
+}
+
+static int hailo15_process_sensor_dataloss_stat_sub(
+    struct hailo15_isp_device *isp_dev, uint8_t pad, uint32_t mis_reg)
+{
+    int ret = 0;
+    uint32_t sensor_index = 0;
+    
+    for (sensor_index = 0; sensor_index < ISP_MIS_SENSORS_COUNT; sensor_index++) {
+        uint32_t sensor_dataloss_mask = ISP_MIS_SENSOR_DATALOSS_FIRST_BIT << sensor_index;
+        ret |= hailo15_process_pad_stat_sub(
+            isp_dev, pad, mis_reg, HAILO15_UEVENT_SENSOR_DATALOSS_STAT,
+            sensor_dataloss_mask, &sensor_index, sizeof(sensor_index));
+    }
+
+    return ret;
+}
+
+static int hailo15_isp_irq_stat_process(struct hailo15_isp_device *isp_dev,
+                uint32_t id, uint32_t mis)
+{
+    uint8_t pad = 0;
+    int ret = 0;
+
+    if (id == HAILO15_ISP_IRQ_EVENT_ISP_MIS) {
+        for (pad = 0; pad < HAILO15_ISP_PADS_NR; pad++) {
+            // Skip sink pads and pads without streams
+            if (hailo15_isp_pad_is_sink(isp_dev, pad) ||
+                !isp_dev->pad_data[pad].stream)
+                continue;
+
+            ret |= hailo15_process_isp_pad_stat_sub(isp_dev, pad, mis,
+                HAILO15_UEVENT_ISP_EXP_STAT, ISP_MIS_EXP_END_MASK);
+            ret |= hailo15_process_isp_pad_stat_sub(isp_dev, pad, mis,
+                HAILO15_UEVENT_ISP_HIST_STAT, ISP_MIS_HIST_MEASURE_RDY_MASK);
+            ret |= hailo15_process_isp_pad_stat_sub(isp_dev, pad, mis,
+                HAILO15_UEVENT_ISP_AWB_STAT, ISP_MIS_AWB_DONE_MASK);
+            ret |= hailo15_process_isp_pad_stat_sub(isp_dev, pad, mis,
+                HAILO15_UEVENT_ISP_AFM_STAT, ISP_MIS_AFM_FIN_MASK);
+            ret |= hailo15_process_isp_pad_stat_sub(isp_dev, pad, mis,
+                HAILO15_UEVENT_VSM_DONE_STAT, ISP_MIS_VSM_DONE);
+
+            ret |= hailo15_process_sensor_dataloss_stat_sub(isp_dev, pad, mis);
+        }
+    } else if (id == HAILO15_ISP_IRQ_EVENT_MI_MIS) {
+        for (pad = 0; pad < HAILO15_ISP_PADS_NR; pad++) {
+            // Skip sink pads and pads without streams
+            if (hailo15_isp_pad_is_sink(isp_dev, pad) ||
+                !isp_dev->pad_data[pad].stream)
+                continue;
+
+            ret |= hailo15_process_isp_pad_stat_sub(isp_dev, pad, mis,
+                HAILO15_UEVENT_ISP_EXPV2_STAT, ISP_MP_JDP_FRAME_END_MASK);
+        }
+    }
+
+    return ret;
+}
+
+irqreturn_t hailo15_process_irq_stats_events(struct hailo15_isp_device *isp_dev,
+    int event_id, uint32_t mis)
+{
+    int ret = 0;
+
+    if (mis == 0) {
+        return IRQ_NONE;
+    }
+
+    ret = hailo15_isp_irq_stat_process(isp_dev, event_id, mis);
+    if (ret) {
+        pr_err("hailo15_isp_irq_stat_process with id %d and mis %x failed with ret %d\n",
+            event_id, mis, ret);
+    }
+
+    return IRQ_HANDLED;
+}
+
 
 /********************/
 /* PM subsystem ops */

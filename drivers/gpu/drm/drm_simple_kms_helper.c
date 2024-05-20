@@ -15,6 +15,7 @@
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
+#include <drm/drm_vblank.h>
 
 /**
  * DOC: overview
@@ -138,7 +139,21 @@ static void drm_simple_kms_crtc_disable(struct drm_crtc *crtc,
 	pipe->funcs->disable(pipe);
 }
 
+static void crtc_atomic_flush(struct drm_crtc *crtc,
+					  struct drm_atomic_state *state)
+{
+	struct drm_pending_vblank_event *event = crtc->state->event;
+	if (crtc->state->event) {
+		crtc->state->event = NULL;
+
+		spin_lock_irq(&crtc->dev->event_lock);
+		drm_crtc_send_vblank_event(crtc, event);
+		spin_unlock_irq(&crtc->dev->event_lock);
+	}
+}
+
 static const struct drm_crtc_helper_funcs drm_simple_kms_crtc_helper_funcs = {
+	.atomic_flush = crtc_atomic_flush,
 	.mode_valid = drm_simple_kms_crtc_mode_valid,
 	.atomic_check = drm_simple_kms_crtc_check,
 	.atomic_enable = drm_simple_kms_crtc_enable,

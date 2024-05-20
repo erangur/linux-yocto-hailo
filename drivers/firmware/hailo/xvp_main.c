@@ -490,7 +490,7 @@ static long xrp_init_common(struct platform_device *pdev, struct xvp *xvp)
         goto err_free_pool;
     }
     xvp->nodeid = nodeid;
-    sprintf(nodename, "xvp%u", nodeid);
+    sprintf(nodename, "dsp%u", nodeid);
 
     xvp->miscdev = (struct miscdevice){
         .minor = MISC_DYNAMIC_MINOR,
@@ -503,7 +503,7 @@ static long xrp_init_common(struct platform_device *pdev, struct xvp *xvp)
     if (ret < 0)
         goto err_free_id;
 
-    sprintf(log_nodename, "xvp_log%u", nodeid);
+    sprintf(log_nodename, "dsp_log%u", nodeid);
 	xvp->misclogdev = (struct miscdevice){
 		.minor = MISC_DYNAMIC_MINOR,
 		.name = devm_kstrdup(&pdev->dev, log_nodename, GFP_KERNEL),

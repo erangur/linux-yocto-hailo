@@ -59,6 +59,7 @@ struct hailo15_video_node {
 	int path;
 	int sequence;
 	int pipeline_init;
+	wait_queue_head_t stream_wait;
 };
 
 struct hailo15_vid_cap_device {

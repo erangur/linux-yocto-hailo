@@ -134,6 +134,19 @@ static int hailo15_get_function_groups(struct pinctrl_dev *pctrl_dev,
 	return 0;
 }
 
+static inline bool hailo15_is_pin_enabled_unprotected(struct hailo15_pinctrl *pinctrl,
+					       unsigned int pin_number)
+{
+	uint32_t data_reg;
+	bool is_enabled;
+
+	data_reg = readl(pinctrl->gpio_pads_config_base +
+			 GPIO_PADS_CONFIG__GPIO_IO_OUTPUT_EN_N_CTRL_BYPASS_EN);
+	is_enabled = !(data_reg & (1 << pin_number));
+
+	return is_enabled;
+}
+
 /*
  * In the SCU-FW in boot time, for all the pins gpio_io_output_en_n_ctrl_bypass_en set to 1,
  * And for all the pins (but the shutdown gpio pin) gpio_io_input_en_ctrl_bypass_en set to 1.
@@ -560,6 +573,142 @@ static const struct of_device_id hailo15_pinctrl_of_match[] = {
 	{},
 };
 
+/*
+ * Initialize runtime data and pins with restrictions from U-boot.
+ */
+static void initialize_current_state(struct device *dev, struct hailo15_pinctrl *pinctrl) {
+	
+	uint32_t data_reg;
+	uint32_t current_modes[H15_PIN_SET_VALUE__COUNT] = {0, };
+	bool enabled_pins[GENERAL_PADS_CONFIG__PADS_PINMUX] = {false, };
+	const struct h15_pin_group *active_groups[ARRAY_SIZE(h15_pin_groups)] = {NULL, };
+	struct h15_pin_data *pin_data;
+	unsigned int num_pins = ARRAY_SIZE(hailo15_pins);
+	unsigned int num_groups = ARRAY_SIZE(h15_pin_groups);
+	unsigned int num_functions = ARRAY_SIZE(h15_pin_functions);
+	unsigned int num_active_groups = 0;
+
+	int i;
+
+	/* Initiate pin_set_runtime_data */
+
+	for (i = 0; i < H15_PIN_SET_VALUE__COUNT; i++) {
+		uint32_t data_reg_mask = pads_pinmux_mode_reg_mask_value[i];
+		uint32_t data_reg_shift = pads_pinmux_mode_shift_value[i];
+		data_reg = readl(pinctrl->general_pads_config_base +
+				 GENERAL_PADS_CONFIG__PADS_PINMUX);
+		current_modes[i] = (data_reg >> data_reg_shift) & data_reg_mask;
+
+		pinctrl->pin_set_runtime_data[i].possible_modes =
+			GENMASK(h15_pin_sets[i].modes_count, 0);
+		pinctrl->pin_set_runtime_data[i].current_mode = current_modes[i];
+	}
+
+	pr_debug("Current modes: %x, %x, %x, %x, %x, %x\n", current_modes[0], current_modes[1], current_modes[2], current_modes[3], current_modes[4], current_modes[5]);
+
+	/* Initiate pins */
+	pin_data = devm_kcalloc(dev, num_pins, sizeof(struct h15_pin_data),
+				GFP_KERNEL);
+	for (i = 0; i < num_pins; i++) {
+		pinctrl->pins[i].number = hailo15_pins[i].number;
+		pinctrl->pins[i].name = hailo15_pins[i].name;
+		pin_data[i].func_selector =
+			H15_PINMUX_INVALID_FUNCTION_SELECTOR;
+		pinctrl->pins[i].drv_data = &(pin_data[i]);
+	}
+
+	/* Get restricting pins */
+	for (i = 0; i < H15_PINMUX_PIN_COUNT; ++i) {
+		/* Only enabled pins are restricting */
+		enabled_pins[i] = hailo15_is_pin_enabled_unprotected(pinctrl, i);
+		pr_debug("Pin %d is %s\n", i, enabled_pins[i] ? "enabled" : "disabled");
+	}
+
+	/*
+	 * Update modes according to active groups.
+	 * Active groups are groups chosen in U-boot.
+	 * We known a group is active if all its pins are enabled and
+	 * the set modes match the current modes.
+	 */
+	for (i = 0; i < num_groups; ++i) {
+		bool all_pins_enabled = true;
+		bool all_modes_match = true;
+		const struct h15_pin_group *group = &h15_pin_groups[i];
+		int j;
+
+		/* Check if all pins of the group are enabled */
+		for (j = 0; j < group->num_pins; ++j) {
+			if (!enabled_pins[group->pins[j]]) {
+				all_pins_enabled = false;
+				break;
+			}
+		}
+		if (!all_pins_enabled) {
+			/* Not all pins are enabled - not an active group */
+			pr_debug("Group %s is not active because of disabled pins\n", group->name);
+			continue;
+		}
+
+		/* Check if the set modes of the group match the current modes */
+		for (j = 0; j < group->num_set_modes; ++j) {
+			const struct h15_pin_set_modes *set_mode = &group->set_modes[j];
+			int current_mode_bit = BIT(current_modes[set_mode->set]);
+			if (!(current_mode_bit & set_mode->modes)) {
+				all_modes_match = false;
+				break;
+			}
+		}
+		if (!all_modes_match) {
+			/* Group modes contradict current mode - not an active group */
+			pr_debug("Group %s is not active because of modes mismatch\n", group->name);
+			continue;
+		}
+
+		/* Group is active */
+		active_groups[num_active_groups++] = group;
+		pr_debug("Group %s is active\n", group->name);
+
+		/* Apply group restrictions - enforce coherent modes */
+		for (j = 0; j < group->num_set_modes; ++j) {
+			pinctrl->pin_set_runtime_data[group->set_modes[j].set].possible_modes &=
+				group->set_modes[j].modes;
+		}
+	}
+
+	/* Update functions */
+	for (i = 0; i < num_functions; ++i) {
+		const struct h15_pin_function *function = &h15_pin_functions[i];
+		int j;
+
+		/* Check if any group is active */
+		for (j = 0; j < function->num_groups; ++j) {
+			const char *const group_name = function->groups[j];
+			const struct h15_pin_group *group = NULL;
+			int k;
+
+			for (k = 0; k < num_active_groups; ++k) {
+				if (strcmp(active_groups[k]->name, group_name) == 0) {
+					group = active_groups[k];
+					break;
+				}
+			}
+			if (!group) {
+				continue;
+			}
+
+			/* Function is active for this group */
+			for (k = 0; k < group->num_pins; ++k) {
+				pr_debug("Pin %s is active for function %s of group %s\n",
+				         pinctrl->pins[group->pins[k]].name, function->name, group_name);
+				pin_data[group->pins[k]].func_selector = i;
+			}
+
+			/* No more than one group can be active for a given function */
+			break;
+		}
+	}
+}
+
 static int hailo15_pinctrl_probe(struct platform_device *pdev)
 {
 	const struct of_device_id *id;
@@ -568,8 +717,6 @@ static int hailo15_pinctrl_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct resource *res;
 	struct device_node *node = dev->of_node;
-	struct h15_pin_data *pin_data;
-	unsigned int i;
 	int ret;
 	unsigned num_pins;
 	unsigned num_functions;
@@ -634,25 +781,7 @@ static int hailo15_pinctrl_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, pinctrl);
 
-	for (i = 0; i < H15_PIN_SET_VALUE__COUNT; i++) {
-		/*
-		* Create a contiguous bitmask starting at bit position h15_pin_sets[i].modes_count and ending at position 0.
-		*/
-		pinctrl->pin_set_runtime_data[i].possible_modes =
-			GENMASK(h15_pin_sets[i].modes_count, 0);
-		pinctrl->pin_set_runtime_data[i].current_mode = 0;
-	}
-
-	pin_data = devm_kcalloc(dev, num_pins, sizeof(struct h15_pin_data),
-				GFP_KERNEL);
-
-	for (i = 0; i < num_pins; i++) {
-		pinctrl->pins[i].number = hailo15_pins[i].number;
-		pinctrl->pins[i].name = hailo15_pins[i].name;
-		pin_data[i].func_selector =
-			H15_PINMUX_INVALID_FUNCTION_SELECTOR;
-		pinctrl->pins[i].drv_data = &(pin_data[i]);
-	}
+	initialize_current_state(dev, pinctrl);
 
 	raw_spin_lock_init(&pinctrl->register_lock);
 

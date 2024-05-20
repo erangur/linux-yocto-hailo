@@ -106,7 +106,7 @@ int hailo15_video_post_event(struct video_device *vdev,
 				event_data->data_size = data_size;
 				memcpy(event_shm->data, data, data_size);
 			} else {
-				pr_err("%s - got data but data size is 0\n", __func__);
+				pr_err("%s - got data with bad data size: %ld\n", __func__, data_size);
 				mutex_unlock(&event_resource->event_lock);
 				return -EINVAL;
 			}

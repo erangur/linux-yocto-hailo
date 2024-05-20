@@ -199,12 +199,13 @@ static const struct drm_display_mode rpi_touchscreen_modes[] = {
 	{
 		/* Modeline comes from the Raspberry Pi firmware, with HFP=1
 		 * plugged in and clock re-computed from that.
+		 * https://github.com/Ysurac/raspberry_kernel_mptcp/blob/master/drivers/gpu/drm/panel/panel-raspberrypi-touchscreen.c
 		 */
 		.clock = 25979400 / 1000,
 		.hdisplay = 800,
-		.hsync_start = 800 + 1,
-		.hsync_end = 800 + 1 + 2,
-		.htotal = 800 + 1 + 2 + 46,
+		.hsync_start = 800 + 61,
+		.hsync_end = 800 + 61 + 2,
+		.htotal = 800 + 61 + 2 + 44,
 		.vdisplay = 480,
 		.vsync_start = 480 + 7,
 		.vsync_end = 480 + 7 + 2,
@@ -265,7 +266,7 @@ static int rpi_touchscreen_noop(struct drm_panel *panel)
 	return 0;
 }
 
-static int rpi_touchscreen_enable(struct drm_panel *panel)
+static int rpi_touchscreen_prepare(struct drm_panel *panel)
 {
 	struct rpi_touchscreen *ts = panel_to_ts(panel);
 	int i;
@@ -294,6 +295,13 @@ static int rpi_touchscreen_enable(struct drm_panel *panel)
 	rpi_touchscreen_write(ts, PPI_STARTPPI, 0x01);
 	rpi_touchscreen_write(ts, DSI_STARTDSI, 0x01);
 	msleep(100);
+
+	return 0;
+}
+
+static int rpi_touchscreen_enable(struct drm_panel *panel)
+{
+	struct rpi_touchscreen *ts = panel_to_ts(panel);
 
 	/* Turn on the backlight. */
 	rpi_touchscreen_i2c_write(ts, REG_PWM, 255);
@@ -349,7 +357,7 @@ static int rpi_touchscreen_get_modes(struct drm_panel *panel,
 static const struct drm_panel_funcs rpi_touchscreen_funcs = {
 	.disable = rpi_touchscreen_disable,
 	.unprepare = rpi_touchscreen_noop,
-	.prepare = rpi_touchscreen_noop,
+	.prepare = rpi_touchscreen_prepare,
 	.enable = rpi_touchscreen_enable,
 	.get_modes = rpi_touchscreen_get_modes,
 };
@@ -463,7 +471,7 @@ static int rpi_touchscreen_dsi_probe(struct mipi_dsi_device *dsi)
 
 	ret = mipi_dsi_attach(dsi);
 
-	if (ret)
+	if (ret && ret != -EPROBE_DEFER)
 		dev_err(&dsi->dev, "failed to attach dsi to host: %d\n", ret);
 
 	return ret;

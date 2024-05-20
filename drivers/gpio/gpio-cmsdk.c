@@ -294,14 +294,6 @@ static int cmsdk_irq_request_resources(struct irq_data *data)
 	struct cmsdk_gpio *cmsdk_gpio = icg->private;
 	int ret;
 
-	ret = cmsdk_gpio->gc.request(&cmsdk_gpio->gc, irqd_to_hwirq(data));
-	if (ret) {
-		dev_err(cmsdk_gpio->gc.parent,
-			"failed to request pin %lu, ret = %d\n",
-			irqd_to_hwirq(data), ret);
-		return ret;
-	}
-
 	ret = cmsdk_gpio->gc.direction_input(&cmsdk_gpio->gc, irqd_to_hwirq(data));
 	if (ret) {
 		dev_err(cmsdk_gpio->gc.parent,

@@ -92,7 +92,8 @@ struct xrp_dsp_buffer {
      * When submitted to DSP: types of access allowed
      * When returned to host: actual access performed
      */
-    __u32 flags;
+    __u32 access_flags;
+    __u32 map_flags;
     __u32 size;
     __u64 addr;
 };

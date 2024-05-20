@@ -73,8 +73,13 @@ struct xrp_request {
     struct xrp_dsp_buffer *buffers_descriptors;
 };
 
+#define REGISTER_PERF_TIME(event, perf_stats, perf_stats_enabled) \
+    do { \
+        if (perf_stats_enabled) perf_stats->event = ktime_get_ns(); \
+    } while(0)
+
 static long xrp_unmap_request(struct xvp *xvp, struct xrp_request *rq,
-    bool writeback)
+    bool writeback, kernel_perf_stats_t *kernel_perf_stats)
 {
     size_t n_buffers = rq->n_buffers;
     size_t i;
@@ -106,6 +111,14 @@ static long xrp_unmap_request(struct xvp *xvp, struct xrp_request *rq,
         }
     }
 
+    if ((rq->ioctl_queue.perf_stats_enabled) && (kernel_perf_stats)){
+        if (copy_to_user((void __user *)(unsigned long)rq->ioctl_queue.kernel_perf_stats_addr,
+                         kernel_perf_stats, sizeof(*kernel_perf_stats))) {
+            dev_err(xvp->dev, "%s: kernel perf stats could not be copied\n", __func__);
+            ret = -EFAULT;
+        }
+    }
+
     if (n_buffers > XRP_DSP_CMD_INLINE_BUFFER_COUNT) {
         dev_dbg(xvp->dev, "%s: unsharing buffers descriptors\n", __func__);
         xrp_unshare(xvp, &rq->buffers_descriptors_mapping,
@@ -115,7 +128,7 @@ static long xrp_unmap_request(struct xvp *xvp, struct xrp_request *rq,
     for (i = 0; i < n_buffers; ++i) {
         dev_dbg(xvp->dev, "%s: unsharing buffer %zd\n", __func__, i);
         rc = xrp_unshare(xvp, rq->buffers_mapping + i,
-            writeback ? rq->buffers_descriptors[i].flags : 0);
+            writeback ? rq->buffers_descriptors[i].map_flags : 0);
         if (rc < 0) {
             dev_err(xvp->dev, "%s: buffer %zd could not be unshared\n",
                  __func__, i);
@@ -259,7 +272,8 @@ static long xrp_map_request(struct file *filp, struct xrp_request *rq,
         }
 
         rq->buffers_descriptors[i] = (struct xrp_dsp_buffer){
-            .flags = ioctl_buffer.flags,
+            .access_flags = ioctl_buffer.flags,
+            .map_flags = 0,
             .size = ioctl_buffer.size,
             .addr = buffer_phys,
         };
@@ -281,7 +295,7 @@ static long xrp_map_request(struct file *filp, struct xrp_request *rq,
 share_err:
     mmap_read_unlock(mm);
     if (ret < 0)
-        xrp_unmap_request(xvp, rq, false);
+        xrp_unmap_request(xvp, rq, false, NULL);
     return ret;
 }
 
@@ -382,6 +396,7 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
     ktime_t dsp_start_time, dsp_end_time;
     uint64_t dsp_command_time_us;
     uint8_t current_threads;
+    kernel_perf_stats_t kernel_perf_stats;
     
     rq = kzalloc(sizeof(struct xrp_request), GFP_KERNEL);
     if (!rq) {
@@ -394,6 +409,8 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
         ret =-EFAULT;
         goto err;
     }
+
+    REGISTER_PERF_TIME(ioctl_received, (&kernel_perf_stats), rq->ioctl_queue.perf_stats_enabled);
 
     if (rq->ioctl_queue.flags & ~XRP_QUEUE_VALID_FLAGS) {
         dev_err(xvp->dev, "%s: invalid flags 0x%08x\n",
@@ -415,6 +432,7 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
 
     atomic_inc(&xvp->stats.current_threads);
     mutex_lock(&queue->lock);
+    REGISTER_PERF_TIME(mutex_acquired, (&kernel_perf_stats), rq->ioctl_queue.perf_stats_enabled);
 
     // we've aquired the mutex
     // further statistics accesses don't have to be atomic
@@ -432,6 +450,7 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
     xrp_fill_hw_request(xvp, queue->comm, rq);
 
     xrp_send_device_irq(xvp);
+    REGISTER_PERF_TIME(irq_sent, (&kernel_perf_stats), rq->ioctl_queue.perf_stats_enabled);
 
     dsp_start_time = ktime_get();
     ret = xrp_wait_for_cmd_completion(xvp, queue);
@@ -440,7 +459,7 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
         goto mutex_err;
     }
     dsp_end_time = ktime_get();
-
+    REGISTER_PERF_TIME(fw_finished, (&kernel_perf_stats), rq->ioctl_queue.perf_stats_enabled);
     dev_dbg(xvp->dev, "%s: cmd completed", __func__);
 
     dsp_command_time_us = ktime_us_delta(dsp_end_time, dsp_start_time);
@@ -455,11 +474,11 @@ long xrp_ioctl_submit_sync(struct file *filp, struct xrp_ioctl_queue __user *p)
 
     if (ret != 0) {
         dev_err(xvp->dev, "%s: failed completing hw request %ld\n", __func__, ret);
-        (void)xrp_unmap_request(xvp, rq, false);
+        (void)xrp_unmap_request(xvp, rq, false, &kernel_perf_stats);
         goto mutex_err;
     }
 
-    ret = xrp_unmap_request(xvp, rq, true);
+    ret = xrp_unmap_request(xvp, rq, true, &kernel_perf_stats);
     if (ret != 0) {
         dev_err(xvp->dev, "%s: failed unmaping request %ld\n", __func__, ret);
         goto mutex_err;

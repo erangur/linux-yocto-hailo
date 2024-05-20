@@ -23,6 +23,8 @@ enum hailo15_video_path {
 #define VIDEO_FPS_MONITOR_SUBDEV_IOC    _IOR('D', BASE_VIDIOC_PRIVATE + 0, uint64_t)
 #define VIDEO_GET_VSM_IOC               _IOWR('D', BASE_VIDIOC_PRIVATE + 1, struct hailo15_get_vsm_params)
 #define VIDEO_GET_P2A_REGS              _IOR('D', BASE_VIDIOC_PRIVATE + 2, struct hailo15_p2a_buffer_regs_addr)
+#define VIDEO_WAIT_FOR_STREAM_START	_IO('D', BASE_VIDIOC_PRIVATE + 3)
+
 
 #define ISPIOC_V4L2_READ_REG            _IOWR('I', BASE_VIDIOC_PRIVATE + 0, struct isp_reg_data)
 #define ISPIOC_V4L2_WRITE_REG           _IOWR('I', BASE_VIDIOC_PRIVATE + 1, struct isp_reg_data)

@@ -66,6 +66,7 @@
 
 #define CSI2RX_LANES_MAX 4
 #define CSI2RX_STREAMS_MAX 4
+#define CSI2RX_LINK_FREQ_MAX 3
 
 #define CSI2RX_DPHY_LANE_CONTROL_REG_ADDR 0x40
 #define CSI2RX_DPHY_LANE_CONTROL_REG_LANES_ENABLE 0x1f01f
@@ -101,6 +102,7 @@ struct csi2rx_fmt {
 enum csi2rx_mode {
 	CSI2RX_MODE_SDR,
 	CSI2RX_MODE_HDR,
+	CSI2RX_MODE_HDR_4K,
 	CSI2RX_MODE_MAX,
 };
 
@@ -157,7 +159,7 @@ struct csi2rx_priv {
 	int source_pad;
 
 	// link frequency in which to configure the internal dphy, if exists
-	u64 link_freq;
+	u64 link_freq[CSI2RX_LINK_FREQ_MAX];
 
 	enum csi2rx_mode cur_mode;
 };
@@ -244,12 +246,17 @@ static int cdns_dphy_rx_band_control_select(u64 data_rate)
 	return 0;
 }
 
-static void cdns_dphy_rx_init(struct csi2rx_priv *csi2rx)
+static int cdns_dphy_rx_init(struct csi2rx_priv *csi2rx)
 {
 	void __iomem *internal_dphy_base = csi2rx->internal_dphy_base;
-	u64 data_rate = csi2rx->link_freq;
 	u32 phy_band_control = 0;
 	u32 clock_selection = 0;
+
+	if (csi2rx->link_freq[csi2rx->cur_mode] == 0) {
+		dev_err(csi2rx->dev, "link_freq for mode %s is not initialized\n",
+			csi2rx->cur_mode == CSI2RX_MODE_SDR ? "SDR" : "HDR");
+		return -ENXIO;
+	}
 
 	writel(CDNS_MIPI_DPHY_RX_TX_DIG_TBIT2_VAL,
 	       internal_dphy_base + CDNS_MIPI_DPHY_RX_TX_DIG_TBIT2_ADDR_OFFSET);
@@ -259,25 +266,20 @@ static void cdns_dphy_rx_init(struct csi2rx_priv *csi2rx)
 	       internal_dphy_base +
 		       CDNS_MIPI_DPHY_RX_CMN_DIG_TBIT2_ADDR_OFFSET);
 
-	clock_selection = cdns_dphy_rx_band_control_select(data_rate);
+	clock_selection = cdns_dphy_rx_band_control_select(csi2rx->link_freq[csi2rx->cur_mode]);
 	phy_band_control =
 		(clock_selection
 		 << CDNS_MIPI_DPHY_RX_PCS_TX_DIG_TBIT0__BAND_CTL_REG_R__SHIFT) |
 		(clock_selection
 		 << CDNS_MIPI_DPHY_RX_PCS_TX_DIG_TBIT0__BAND_CTL_REG_L__SHIFT);
 
-	if(csi2rx->cur_mode == CSI2RX_MODE_SDR){
-		pr_debug("%s - mode sdr set dphy rate from DTS\n", __func__);
-		writel(phy_band_control,
-			internal_dphy_base + CDNS_MIPI_DPHY_RX_TX_DIG_TBIT0_ADDR_OFFSET);
-	}
-	else {
-		pr_debug("%s - mode hdr set dphy rate to 0x1ad\n", __func__);
-		writel(0x1ad,
-			internal_dphy_base + CDNS_MIPI_DPHY_RX_TX_DIG_TBIT0_ADDR_OFFSET);
-	}
+	dev_dbg(csi2rx->dev, "%s - set dphy rate from DTS to 0x%x\n", __func__, phy_band_control);
+	writel(phy_band_control,
+		internal_dphy_base + CDNS_MIPI_DPHY_RX_TX_DIG_TBIT0_ADDR_OFFSET);
+
 
 	dev_dbg(csi2rx->dev, "finished cdns_dphy_rx_init");
+	return 0;
 }
 
 static void csi2rx_reset(struct csi2rx_priv *csi2rx)
@@ -315,7 +317,9 @@ static int csi2rx_start(struct csi2rx_priv *csi2rx)
 	if (csi2rx->has_internal_dphy) {
 		writel(CSI2RX_DPHY_LANE_CTRL_RESET_LANES,
 		       csi2rx->base + CSI2RX_DPHY_LANE_CTRL_REG);
-		cdns_dphy_rx_init(csi2rx);
+		ret = cdns_dphy_rx_init(csi2rx);
+		if (ret)
+			goto err_disable_pclk;
 		writel(CSI2RX_DPHY_LANE_CTRL_ENABLE_LANES,
 		       csi2rx->base + CSI2RX_DPHY_LANE_CTRL_REG);
 	}
@@ -684,6 +688,7 @@ static void csi2rx_parse_v4l2_remote_ep(struct csi2rx_priv *csi2rx)
 	struct fwnode_handle *fwh;
 	struct device_node *ep;
 	struct fwnode_handle *remote_ep;
+	int i;
 	int ret;
 
 	ep = of_graph_get_endpoint_by_regs(csi2rx->dev->of_node, 0, 0);
@@ -698,12 +703,18 @@ static void csi2rx_parse_v4l2_remote_ep(struct csi2rx_priv *csi2rx)
 		v4l2_fwnode_endpoint_free(&v4l2_ep);
 		return;
 	}
-	if (v4l2_ep.nr_of_link_frequencies > 1) {
+	if (v4l2_ep.nr_of_link_frequencies == 0 ||
+		v4l2_ep.nr_of_link_frequencies > CSI2RX_LINK_FREQ_MAX) {
 		dev_err(csi2rx->dev,
-			"No support for multiple link frequencies yet");
+			"Unsupported number of link frequencies: %d\n",
+			v4l2_ep.nr_of_link_frequencies);
 		return;
 	}
-	csi2rx->link_freq = v4l2_ep.link_frequencies[0];
+
+	for (i = 0; i < v4l2_ep.nr_of_link_frequencies; i++){
+		csi2rx->link_freq[i] = v4l2_ep.link_frequencies[i];
+		dev_info(csi2rx->dev, "link_freq[%d] = %llu\n", i, csi2rx->link_freq[i]);
+	}
 	of_node_put(ep);
 	v4l2_fwnode_endpoint_free(&v4l2_ep);
 }
@@ -804,6 +815,8 @@ static int csi2rx_probe(struct platform_device *pdev)
 	unsigned int i;
 	int ret;
 
+    dev_info(&pdev->dev, "probe started");
+
 	csi2rx = kzalloc(sizeof(*csi2rx), GFP_KERNEL);
 	if (!csi2rx)
 		return -ENOMEM;
@@ -854,10 +867,9 @@ static int csi2rx_probe(struct platform_device *pdev)
 
 	dev_info(
 		&pdev->dev,
-		"Probed CSI2RX with %u/%u lanes, %u streams, %s D-PHY with link frequency of %llu bps\n",
+		"Probed CSI2RX with %u/%u lanes, %u streams, %s D-PHY\n",
 		csi2rx->num_lanes, csi2rx->max_lanes, csi2rx->max_streams,
-		csi2rx->has_internal_dphy ? "internal" : "no",
-		csi2rx->link_freq);
+		csi2rx->has_internal_dphy ? "internal" : "no");
 
 	return 0;
 

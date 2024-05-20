@@ -15,6 +15,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-subdev.h>
+#include "sensor_id.h"
 
 #define DEFAULT_MODE_IDX 0
 
@@ -26,10 +27,6 @@
 /* Lines per frame */
 #define IMX334_REG_LPFR		0x3030
 #define IMX334_MAX_LPFR_4K (1 << 20) - 2 - 2160 // max even value of unsigned 20bit - 4k #lines
-
-/* Chip ID */
-#define IMX334_REG_ID		0x3044
-#define IMX334_ID		0x1e
 
 /* Exposure control */
 #define IMX334_REG_SHUTTER	0x3058
@@ -1136,16 +1133,18 @@ static int imx334_detect(struct imx334 *imx334)
 	int ret;
 	u32 val;
 
-	ret = imx334_read_reg(imx334, IMX334_REG_ID, 2, &val);
+	ret = imx334_read_reg(imx334, GENERIC_SENSOR_ID_REG, 1, &val);
 	if (ret)
 		return ret;
 
-	if (val != IMX334_ID) {
-		dev_err(imx334->dev, "chip id mismatch: %x!=%x",
-			IMX334_ID, val);
+	if (val != SENSOR_ID_IMX334) {
+		dev_info(imx334->dev,
+			"sensor is not connected: (expected %x, found %x)",
+			SENSOR_ID_IMX334, val);
 		return -ENXIO;
 	}
 
+	dev_info(imx334->dev, "sensor detected!");
 	return 0;
 }
 
@@ -1408,6 +1407,7 @@ static int imx334_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	imx334->dev = &client->dev;
+    dev_info(imx334->dev, "probe started");
 
 	/* Initialize subdev */
 	v4l2_i2c_subdev_init(&imx334->sd, client, &imx334_subdev_ops);
@@ -1428,7 +1428,10 @@ static int imx334_probe(struct i2c_client *client)
 
 	/* Check module identity */
 	ret = imx334_detect(imx334);
-	if (ret) {
+    if (ret == -ENXIO) {
+        // imx334 is not connected, but another sensor might be
+        goto error_power_off;
+    } else if (ret) {
 		dev_err(imx334->dev, "failed to find sensor: %d", ret);
 		goto error_power_off;
 	}
@@ -1457,8 +1460,7 @@ static int imx334_probe(struct i2c_client *client)
 
 	ret = v4l2_async_register_subdev_sensor(&imx334->sd);
 	if (ret < 0) {
-		dev_err(imx334->dev,
-			"failed to register async subdev: %d", ret);
+		dev_err(imx334->dev, "failed to register async subdev: %d", ret);
 		goto error_media_entity;
 	}
 
@@ -1466,6 +1468,7 @@ static int imx334_probe(struct i2c_client *client)
 	pm_runtime_enable(imx334->dev);
 	pm_runtime_idle(imx334->dev);
 
+    dev_info(imx334->dev, "probe finished successfully");
 	return 0;
 
 error_media_entity:
@@ -1477,6 +1480,12 @@ error_power_off:
 error_mutex_destroy:
 	mutex_destroy(&imx334->mutex);
 
+    if (ret == -ENXIO) {
+        dev_info(imx334->dev, "exit probe, sensor not connected");
+    } else {
+        dev_err(imx334->dev, "probe failed with %d", ret);
+    }
+    
 	return ret;
 }
 

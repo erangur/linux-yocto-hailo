@@ -462,7 +462,9 @@ struct cdns_dsi {
 	struct reset_control *dsi_p_rst;
 	struct clk *dsi_sys_clk;
 	bool link_initialized;
+	bool phy_initialized;
 	struct phy *dphy;
+	bool tvg_mode_enable;
 };
 
 static inline struct cdns_dsi *input_to_dsi(struct cdns_dsi_input *input)
@@ -586,11 +588,8 @@ static int cdns_dsi_adjust_phy_config(struct cdns_dsi *dsi,
 
 	/* data rate in bytes/sec is not an integer, refuse the mode. */
 	dpi_htotal = mode_valid_check ? mode->htotal : mode->crtc_htotal;
-	if (do_div(dlane_bps, lanes * dpi_htotal))
-		return -EINVAL;
 
-	/* data rate was in bytes/sec, convert to bits/sec. */
-	phy_cfg->hs_clk_rate = dlane_bps * 8;
+	// phy_cfg->hs_clk_rate set at phy_mipi_dphy_get_default_config
 
 	dsi_hfp_ext = adj_dsi_htotal - dsi_htotal;
 	dsi_cfg->hfp += dsi_hfp_ext;
@@ -614,7 +613,7 @@ static int cdns_dsi_check_conf(struct cdns_dsi *dsi,
 	if (ret)
 		return ret;
 
-	phy_mipi_dphy_get_default_config(mode->crtc_clock * 1000,
+	phy_mipi_dphy_get_default_config((mode_valid_check ? mode->clock : mode->crtc_clock) * 1000,
 					 mipi_dsi_pixel_format_to_bpp(output->dev->format),
 					 nlanes, phy_cfg);
 
@@ -715,6 +714,9 @@ static void cdns_dsi_hs_init(struct cdns_dsi *dsi)
 {
 	struct cdns_dsi_output *output = &dsi->output;
 	u32 status;
+	
+	if (dsi->phy_initialized)
+		return;
 
 	/*
 	 * Power all internal DPHY blocks down and maintain their reset line
@@ -739,6 +741,8 @@ static void cdns_dsi_hs_init(struct cdns_dsi *dsi)
 	writel(DPHY_CMN_PSO | DPHY_ALL_D_PDN | DPHY_C_PDN | DPHY_CMN_PDN |
 	       DPHY_D_RSTB(output->dev->lanes) | DPHY_C_RSTB,
 	       dsi->regs + MCTL_DPHY_CFG0);
+
+	dsi->phy_initialized = true;
 }
 
 static void cdns_dsi_init_link(struct cdns_dsi *dsi)
@@ -908,17 +912,68 @@ static void cdns_dsi_bridge_enable(struct drm_bridge *bridge)
 	if (output->dev->mode_flags & MIPI_DSI_MODE_VIDEO)
 		tmp |= IF_VID_MODE | IF_VID_SELECT(input->id) | VID_EN;
 
+	if (dsi->tvg_mode_enable) {
+		tmp |= TVG_SEL;
+	}
+
 	writel(tmp, dsi->regs + MCTL_MAIN_DATA_CTL);
 
-	tmp = readl(dsi->regs + MCTL_MAIN_EN) | IF_EN(input->id);
-	writel(tmp, dsi->regs + MCTL_MAIN_EN);
+	if (dsi->tvg_mode_enable) {
+		tmp = TVG_STRIPE_SIZE(0x7) | TVG_MODE_HSTRIPES | TVG_STOPMODE_EOF;
+		writel(tmp, dsi->regs + TVG_CTL);
+
+		tmp = TVG_COL1_RED(0xfff) | TVG_COL1_GREEN(0xfff);
+		writel(tmp, dsi->regs + TVG_COLOR1);
+
+		tmp = TVG_COL1_BLUE(0xfff);
+		writel(tmp, dsi->regs + TVG_COLOR1_BIS);
+
+		tmp = TVG_COL2_RED(0x0) | TVG_COL2_GREEN(0x0);
+		writel(tmp, dsi->regs + TVG_COLOR2);
+
+		tmp = TVG_COL2_BLUE(0xfff);
+		writel(tmp, dsi->regs + TVG_COLOR2_BIS);
+
+		tmp = TVG_LINE_SIZE(dsi_cfg.hact) | TVG_NBLINES(mode->crtc_vdisplay);
+		writel(tmp, dsi->regs + TVG_IMG_SIZE);
+
+		tmp = readl(dsi->regs + TVG_CTL);
+		tmp |= TVG_RUN;
+		writel(tmp, dsi->regs + TVG_CTL);
+	}
+	else {
+		tmp = readl(dsi->regs + MCTL_MAIN_EN) | IF_EN(input->id);
+		writel(tmp, dsi->regs + MCTL_MAIN_EN);
+	}
+}
+
+static void cdns_dsi_bridge_pre_enable(struct drm_bridge *bridge)
+{
+	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
+	struct cdns_dsi *dsi = input_to_dsi(input);
+
+	if (WARN_ON(pm_runtime_get_sync(dsi->base.dev) < 0))
+		return;
+
+	cdns_dsi_init_link(dsi);
+	cdns_dsi_hs_init(dsi);
+}
+
+static void cdns_dsi_bridge_post_disable(struct drm_bridge *bridge)
+{
+	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
+	struct cdns_dsi *dsi = input_to_dsi(input);
+
+	pm_runtime_put(dsi->base.dev);
 }
 
 static const struct drm_bridge_funcs cdns_dsi_bridge_funcs = {
 	.attach = cdns_dsi_bridge_attach,
 	.mode_valid = cdns_dsi_bridge_mode_valid,
 	.disable = cdns_dsi_bridge_disable,
+	.pre_enable = cdns_dsi_bridge_pre_enable,
 	.enable = cdns_dsi_bridge_enable,
+	.post_disable = cdns_dsi_bridge_post_disable,
 };
 
 static int cdns_dsi_attach(struct mipi_dsi_host *host,
@@ -956,6 +1011,10 @@ static int cdns_dsi_attach(struct mipi_dsi_host *host,
 		np = of_node_get(dev->dev.of_node);
 
 	panel = of_drm_find_panel(np);
+
+	if (PTR_ERR(panel) == -EPROBE_DEFER)
+		return PTR_ERR(panel);
+	
 	if (!IS_ERR(panel)) {
 		bridge = drm_panel_bridge_add_typed(panel,
 						    DRM_MODE_CONNECTOR_DSI);
@@ -1033,6 +1092,7 @@ static ssize_t cdns_dsi_transfer(struct mipi_dsi_host *host,
 		return ret;
 
 	cdns_dsi_init_link(dsi);
+	cdns_dsi_hs_init(dsi);
 
 	ret = mipi_dsi_create_packet(&packet, msg);
 	if (ret)
@@ -1061,9 +1121,6 @@ static ssize_t cdns_dsi_transfer(struct mipi_dsi_host *host,
 
 	cmd = CMD_SIZE(tx_len) | CMD_VCHAN_ID(msg->channel) |
 	      CMD_DATATYPE(msg->type);
-
-	if (msg->flags & MIPI_DSI_MSG_USE_LPM)
-		cmd |= CMD_LP_EN;
 
 	if (mipi_dsi_packet_format_is_long(msg->type))
 		cmd |= CMD_LONG;
@@ -1161,6 +1218,7 @@ static int __maybe_unused cdns_dsi_suspend(struct device *dev)
 	clk_disable_unprepare(dsi->dsi_p_clk);
 	reset_control_assert(dsi->dsi_p_rst);
 	dsi->link_initialized = false;
+	dsi->phy_initialized = false;
 	return 0;
 }
 
@@ -1188,6 +1246,8 @@ static int cdns_dsi_drm_probe(struct platform_device *pdev)
 	if (IS_ERR(dsi->regs))
 		return PTR_ERR(dsi->regs);
 
+	dsi->tvg_mode_enable = of_property_read_bool(pdev->dev.of_node, "tvg-mode-enable");
+
 	dsi->dsi_p_clk = devm_clk_get(&pdev->dev, "dsi_p_clk");
 	if (IS_ERR(dsi->dsi_p_clk))
 		return PTR_ERR(dsi->dsi_p_clk);
@@ -1213,6 +1273,10 @@ static int cdns_dsi_drm_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = clk_prepare_enable(dsi->dsi_sys_clk);
+	if (ret)
+		return ret;
+
 	val = readl(dsi->regs + ID_REG);
 	if (REV_VENDOR_ID(val) != 0xcad) {
 		dev_err(&pdev->dev, "invalid vendor id\n");
@@ -1229,11 +1293,7 @@ static int cdns_dsi_drm_probe(struct platform_device *pdev)
 	writel(0, dsi->regs + MCTL_MAIN_EN);
 	writel(0, dsi->regs + MCTL_MAIN_PHY_CTL);
 
-	/*
-	 * We only support the DPI input, so force input->id to
-	 * CDNS_DPI_INPUT.
-	 */
-	input->id = CDNS_DPI_INPUT;
+	input->id = CDNS_SDI_INPUT;
 	input->bridge.funcs = &cdns_dsi_bridge_funcs;
 	input->bridge.of_node = pdev->dev.of_node;
 
@@ -1259,6 +1319,7 @@ static int cdns_dsi_drm_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_disable_runtime_pm;
 
+	clk_disable_unprepare(dsi->dsi_sys_clk);
 	clk_disable_unprepare(dsi->dsi_p_clk);
 
 	return 0;

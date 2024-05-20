@@ -465,7 +465,7 @@ static int pixel_mux_probe(struct platform_device *pdev)
 	struct resource *res;
 	unsigned int i;
 
-	dev_info(&pdev->dev, "%s enter\n", __func__);
+	dev_info(&pdev->dev, "probe started");
 
 	pixel_mux = kzalloc(sizeof(*pixel_mux), GFP_KERNEL);
 	if (!pixel_mux)

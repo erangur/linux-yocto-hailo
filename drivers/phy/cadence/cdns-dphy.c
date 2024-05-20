@@ -45,6 +45,10 @@
 #define DPHY_CMN_OPDIV_FROM_REG		BIT(6)
 #define DPHY_CMN_OPDIV(x)		((x) << 7)
 
+#define DPHY_BAND_CFG			DPHY_PCS(0x0)
+#define DPHY_BAND_CFG_LEFT_BAND		GENMASK(4, 0)
+#define DPHY_BAND_CFG_RIGHT_BAND	GENMASK(9, 5)
+
 #define DPHY_PSM_CFG			DPHY_PCS(0x4)
 #define DPHY_PSM_CFG_FROM_REG		BIT(0)
 #define DPHY_PSM_CLK_DIV(x)		((x) << 1)
@@ -88,8 +92,15 @@ struct cdns_dphy {
 	void __iomem *regs;
 	struct clk *psm_clk;
 	struct clk *pll_ref_clk;
+	struct clk *esc_clk;
 	const struct cdns_dphy_ops *ops;
 	struct phy *phy;
+};
+
+/* Order of bands is important since the index is the band number. */
+static const unsigned int tx_bands[] = {
+	80, 100, 120, 160, 200, 240, 320, 390, 450, 510, 560, 640, 690, 770,
+	870, 950, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2500
 };
 
 static int cdns_dsi_get_dphy_pll_cfg(struct cdns_dphy *dphy,
@@ -169,8 +180,8 @@ static unsigned long cdns_dphy_get_wakeup_time_ns(struct cdns_dphy *dphy)
 
 static unsigned long cdns_dphy_ref_get_wakeup_time_ns(struct cdns_dphy *dphy)
 {
-	/* Default wakeup time is 800 ns (in a simulated environment). */
-	return 800;
+	/* Minimum wakeup time as per MIPI D-PHY spec v1.2 */
+	return 1000000;
 }
 
 static void cdns_dphy_ref_set_pll_cfg(struct cdns_dphy *dphy,
@@ -232,6 +243,24 @@ static int cdns_dphy_config_from_opts(struct phy *phy,
 	return 0;
 }
 
+static int cdns_dphy_tx_get_band_ctrl(unsigned long hs_clk_rate)
+{
+	unsigned int rate;
+	int i;
+
+	rate = hs_clk_rate / 1000000UL;
+
+	if (rate < tx_bands[0])
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < ARRAY_SIZE(tx_bands) - 1; i++) {
+		if (rate >= tx_bands[i] && rate < tx_bands[i + 1])
+			return i;
+	}
+
+	return -EOPNOTSUPP;
+}
+
 static int cdns_dphy_validate(struct phy *phy, enum phy_mode mode, int submode,
 			      union phy_configure_opts *opts)
 {
@@ -247,7 +276,8 @@ static int cdns_dphy_configure(struct phy *phy, union phy_configure_opts *opts)
 {
 	struct cdns_dphy *dphy = phy_get_drvdata(phy);
 	struct cdns_dphy_cfg cfg = { 0 };
-	int ret;
+	int ret, band_ctrl;
+	unsigned int reg;
 
 	ret = cdns_dphy_config_from_opts(phy, &opts->mipi_dphy, &cfg);
 	if (ret)
@@ -276,6 +306,14 @@ static int cdns_dphy_configure(struct phy *phy, union phy_configure_opts *opts)
 	 */
 	cdns_dphy_set_pll_cfg(dphy, &cfg);
 
+	band_ctrl = cdns_dphy_tx_get_band_ctrl(opts->mipi_dphy.hs_clk_rate);
+	if (band_ctrl < 0)
+		return band_ctrl;
+
+	reg = FIELD_PREP(DPHY_BAND_CFG_LEFT_BAND, band_ctrl) |
+	      FIELD_PREP(DPHY_BAND_CFG_RIGHT_BAND, band_ctrl);
+	writel(reg, dphy->regs + DPHY_BAND_CFG);
+
 	return 0;
 }
 
@@ -285,6 +323,7 @@ static int cdns_dphy_power_on(struct phy *phy)
 
 	clk_prepare_enable(dphy->psm_clk);
 	clk_prepare_enable(dphy->pll_ref_clk);
+	clk_prepare_enable(dphy->esc_clk);
 
 	/* Start TX state machine. */
 	writel(DPHY_CMN_SSM_EN | DPHY_CMN_TX_MODE_EN,
@@ -299,6 +338,7 @@ static int cdns_dphy_power_off(struct phy *phy)
 
 	clk_disable_unprepare(dphy->pll_ref_clk);
 	clk_disable_unprepare(dphy->psm_clk);
+	clk_disable_unprepare(dphy->esc_clk);
 
 	return 0;
 }
@@ -336,6 +376,11 @@ static int cdns_dphy_probe(struct platform_device *pdev)
 	dphy->pll_ref_clk = devm_clk_get(&pdev->dev, "pll_ref");
 	if (IS_ERR(dphy->pll_ref_clk))
 		return PTR_ERR(dphy->pll_ref_clk);
+
+	dphy->esc_clk = devm_clk_get(&pdev->dev, "esc_clk");
+	if (IS_ERR(dphy->esc_clk)) {
+		return PTR_ERR(dphy->esc_clk);
+	}
 
 	if (dphy->ops->probe) {
 		ret = dphy->ops->probe(dphy);
